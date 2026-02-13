@@ -667,6 +667,66 @@ static void AutoEnableWaitForTuiIfNeeded() {
     }
 }
 
+// ========================================================================
+// Shell Compatibility for AppContainer
+// ========================================================================
+// MSYS2-based shells (Git Bash, Cygwin bash) cannot run inside AppContainer
+// because they require creating kernel namespace objects under
+// \BaseNamedObjects\msys-2.0* which is blocked by the sandbox
+// (NtCreateDirectoryObject returns 0xC0000022 = STATUS_ACCESS_DENIED).
+// Detect and replace SHELL env var with cmd.exe automatically.
+// ========================================================================
+static bool IsMsys2OrCygwinPath(const std::wstring& path) {
+    if (path.empty()) return false;
+    std::wstring lower = ToLowerCopy(path);
+
+    // Git for Windows: C:\Program Files\Git\usr\bin\bash.exe
+    //                  C:\Program Files\Git\bin\bash.exe
+    if (lower.find(L"\\git\\") != std::wstring::npos &&
+        lower.find(L"bash") != std::wstring::npos) return true;
+
+    // MSYS2 standalone: C:\msys64\usr\bin\bash.exe
+    if (lower.find(L"\\msys") != std::wstring::npos) return true;
+
+    // Cygwin: C:\cygwin64\bin\bash.exe
+    if (lower.find(L"\\cygwin") != std::wstring::npos) return true;
+
+    return false;
+}
+
+static void FixShellForAppContainer() {
+    // Check current SHELL env var
+    std::wstring currentShell = GetEnvVarCopy(L"SHELL");
+    std::wstring comspec = GetEnvVarCopy(L"COMSPEC");
+
+    // Default safe shell: prefer the system's own COMSPEC if available
+    std::wstring safeShell = comspec.empty() ? L"C:\\Windows\\System32\\cmd.exe" : comspec;
+
+    bool needFix = false;
+
+    // Case 1: SHELL points to MSYS2/Cygwin bash -> must override
+    if (!currentShell.empty() && IsMsys2OrCygwinPath(currentShell)) {
+        LogWarn(L"[ShellCompat] SHELL=%ls is MSYS2/Cygwin-based, incompatible with AppContainer.",
+                currentShell.c_str());
+        needFix = true;
+    }
+
+    // Case 2: SHELL not set -> OpenCode/Node may discover bash.exe via PATH,
+    // triggering uv_spawn('bash.exe') which fails in AppContainer. Preempt.
+    if (currentShell.empty()) {
+        LogInfo(L"[ShellCompat] SHELL not set, setting to cmd.exe for AppContainer compatibility.");
+        needFix = true;
+    }
+
+    if (needFix) {
+        UpsertEnvOverride(L"SHELL", safeShell);
+        UpsertEnvOverride(L"COMSPEC", safeShell);
+        LogInfo(L"[ShellCompat] Override: SHELL=%ls, COMSPEC=%ls", safeShell.c_str(), safeShell.c_str());
+    } else {
+        LogDebug(L"[ShellCompat] SHELL=%ls appears compatible, no override needed.", currentShell.c_str());
+    }
+}
+
 static bool ResolveSubstPath(const std::wstring& inputPath, std::wstring* resolvedPath) {
     if (!resolvedPath) return false;
 
@@ -3201,6 +3261,7 @@ int wmain(int argc, WCHAR** argv) {
     ApplyDefaultOpenCodeEnvPaths();
     ApplyBunOpenTuiCompatibility();
     AutoEnableWaitForTuiIfNeeded();
+    FixShellForAppContainer();
 
     if (WaitForExit) {
         UpsertEnvOverride(L"TERM", L"xterm-256color");
