@@ -4,82 +4,84 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This project ("box_opencode") runs an AI coding assistant (`opencode.exe`) inside a Windows AppContainer sandbox for security isolation. It has two components:
-
-1. **LaunchAppContainer** — A C++ launcher that creates an AppContainer/LPAC sandbox and runs a target executable inside it with restricted permissions.
-2. **opencode.exe** — A Node.js-based AI coding assistant (pre-built binary, not built from this repo).
+Windows AppContainer sandbox launcher ("box_opencode") that runs `opencode.exe` (a pre-built AI coding assistant binary) inside an isolated AppContainer/LPAC sandbox. The launcher is a single-file C++ application.
 
 ## Build
 
 Requires Visual Studio 2022 with C++ desktop workload and Windows 10 SDK.
 
-Build the launcher with MSBuild:
 ```powershell
+# Build with MSBuild (adjust path to your VS installation)
 & "D:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" `
-  "C:\Users\Administrator\Desktop\box\LaunchAppContainer\LaunchAppContainer.sln" `
-  /p:Configuration=Release
+  LaunchAppContainer\LaunchAppContainer.sln /p:Configuration=Release
+
+# Or use the automation script (builds, copies exe to root, cleans opencode data, launches)
+.\start.ps1
 ```
 
-Output: `LaunchAppContainer\LaunchAppContainer\x64\Release\LaunchAppContainer.exe`
+Output: `LaunchAppContainer\x64\Release\LaunchAppContainer.exe`
 
-The `start.ps1` script automates the full workflow: build → copy exe to root → clean opencode data → launch.
+Build configurations: `Debug|Win32`, `Release|Win32`, `Debug|x64`, `Release|x64` (x64 Release recommended).
+
+Note: `start.ps1` has hardcoded paths (`D:\study_ap\box`). Adjust before use in a different environment.
 
 ## Run
 
 ```powershell
-# Automated build + launch
-.\start.ps1
-
-# Direct launch (uses config.ini)
-.\LaunchAppContainer.exe
-
-# CLI usage
+.\LaunchAppContainer.exe                    # Uses config.ini in same directory
 LaunchAppContainer.exe -m <moniker> -i <exe> [-c capabilities] [-w] [-r] [-l] [-k]
 ```
 
+No test suite. Verify by running the sandbox and checking log output (enable `log = true` in config.ini).
+
 ## Architecture
 
-```
-config.ini ──→ LaunchAppContainer.exe (C++)
-                  │
-                  ├─ Parses config.ini or CLI args
-                  ├─ Creates AppContainer sandbox with capability SIDs
-                  ├─ Modifies ACLs on allowPaths for sandbox access
-                  ├─ Sets up environment variables (HOME, TEMP, XDG_*, OPENCODE_CONFIG)
-                  ├─ Applies Bun/OpenCode runtime compatibility
-                  └─ Launches opencode.exe inside the sandbox via ConPTY
-                        │
-                        └─ opencode.exe runs sandboxed
-                             ├─ opencode/config/  (configuration)
-                             ├─ opencode/cache/   (model definitions, version)
-                             ├─ opencode/data/    (sessions, messages, logs)
-                             └─ opencode/work/    (working directory)
-```
+All sandbox logic lives in one file: `LaunchAppContainer/LaunchAppContainer/LaunchAppContainer.cpp` (~3400 lines).
 
-## Key Files
+Execution flow in `wmain()`:
+1. Parse `config.ini` (or CLI args) → populate global state
+2. Create AppContainer profile with capability SIDs
+3. Modify ACLs on `allowPaths` to grant sandbox access (saved for restore on exit)
+4. Optionally start network filter proxy (`NetworkFilterPlugin`) and inject `HTTP_PROXY`/`HTTPS_PROXY` env vars
+5. Optionally prepare Bun virtual drive (`B:\~BUN`) for Bun runtime compatibility
+6. Build child environment block (HOME, TEMP, XDG_*, OPENCODE_CONFIG, etc.)
+7. Launch target exe inside sandbox via `CreateProcess` with `SECURITY_CAPABILITIES`, optionally through ConPTY
+8. On exit: restore ACLs, cleanup Bun drive, shutdown network filter, delete AppContainer profile
 
-- `LaunchAppContainer/LaunchAppContainer/LaunchAppContainer.cpp` — Single-file C++ implementation (~3300 lines). Contains all sandbox creation logic: AppContainer profile management, SID/capability handling, ACL modification, environment setup, ConPTY pseudo-console, and process launching.
-- `config.ini` — Runtime configuration: moniker, exe path, capabilities, allowed filesystem paths.
-- `start.ps1` — Build and launch automation script.
+Key subsystems within the single .cpp file:
+- **Config parsing** (~L1099-1180): INI file reader + CLI argument parser
+- **AppContainer management** (~L1323-1370): Profile create/delete via `CreateAppContainerProfile`
+- **ACL modification** (~L1371-1580): `GrantFullControlToSidOnPath`, `SetLowIntegrityLabel`, save/restore original security
+- **ConPTY** (~L1583-1715): Dynamically loaded from kernel32.dll, input/output relay threads
+- **Bun virtual drive** (~L2399-2700): Extracts embedded DLL from Bun exe, maps `B:\~BUN` via `DefineDosDevice`
+- **Network filter proxy** (`NetworkFilterPlugin.h` + implementation): HTTP/HTTPS domain-based filtering proxy
+- **Process launch** (~L2783-3090): `CreateProcess` with `SECURITY_CAPABILITIES`, ConPTY, job object sandbox
 
 ## config.ini Format
 
 ```ini
 [App]
-moniker = your-sandbox          # AppContainer package identifier
-displayName = NodeTuiSandbox    # Profile display name
-exe = opencode.exe              # Target executable
-wait = true                     # Wait for child process exit
-newConsole = true               # Use ConPTY pseudo-console
-lowIntegrityOnPaths = false     # Set low integrity on allowed paths
-allowPaths = C:\path\to\dir     # Filesystem paths accessible to sandbox
-capabilities = internetClient   # Capability SIDs (semicolon-separated)
+moniker = your-sandbox              # AppContainer package identifier
+displayName = NodeTuiSandbox        # Profile display name
+exe = opencode.exe                  # Target executable
+wait = true                         # Wait for child process exit
+newConsole = false                  # Allocate new console for child
+conpty = false                      # Use ConPTY pseudo-console
+jobSandbox = true                   # Use job object for additional sandboxing
+lowIntegrityOnPaths = false         # Set low integrity label on allowed paths
+allowPaths = C:\path\to\dir         # Filesystem paths accessible to sandbox
+capabilities = internetClient       # Capability SIDs (semicolon-separated)
+log = true                          # Enable logging to timestamped .log file
+networkFilterEnabled = true|false   # Enable domain-based network filtering proxy
+networkFilterPort = 8080            # Local proxy port
+networkFilterAllowedUrls = *.example.com;api.other.com  # Allowed domain patterns
 ```
 
-## C++ Codebase Notes
+## C++ Codebase Conventions
 
-- Targets Windows 10+ (`_WIN32_WINNT 0x0A00`), compiled with C++17, Unicode charset, static CRT linking.
-- Links against `Userenv.lib`, `Advapi32.lib`, `OneCoreUAP.lib`.
-- Key structs: `SidAttrWrap` (RAII wrapper for SID_AND_ATTRIBUTES), `EnvKV` (environment variable pairs), `SavedSecurity` (ACL backup/restore).
-- ConPTY functions are loaded dynamically from `kernel32.dll`.
-- No test suite exists. Verification is done by running the sandbox and checking log output in `opencode/data/opencode/log/`.
+- Targets Windows 10+ (`_WIN32_WINNT 0x0A00`), C++17, Unicode charset, static CRT linking (`/MT`).
+- Links: `Userenv.lib`, `Advapi32.lib`, `OneCoreUAP.lib`.
+- RAII wrappers: `SidAttrWrap` (SID ownership), `SavedSecurity` (ACL backup/restore).
+- Global state via `static` variables at file scope — no classes for the main logic.
+- Naming: PascalCase for structs/functions, camelCase for local variables, `g_` prefix for globals.
+- All Windows API calls must have return value checks; use `GetLastError()` for diagnostics.
