@@ -19,6 +19,8 @@
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OneCoreUAP.lib")
 
+#include "NetworkFilterPlugin.h"
+
 #ifndef CP_UTF8
 #define CP_UTF8 65001
 #endif
@@ -116,12 +118,22 @@ static bool UseNewConsole = true;
 static bool UseConPty = false;
 static bool HideParentConsole = true;
 static bool g_LogEnabled = false;
+static bool UseJobSandbox = false;
+
+// Network Filter Plugin state
+static bool g_NetworkFilterEnabled = false;
+static int  g_NetworkFilterPort = 8080;
+static std::wstring g_NetworkFilterAllowedUrls;
+
+// Job Object sandbox state (alternative to AppContainer)
+static HANDLE g_hJobObject = nullptr;
 
 // Bun Virtual Drive (B:\~BUN) state
 static volatile LONG g_BunCleanupDone = 0;
 static bool g_BunDriveMapped = false;
 static std::wstring g_BunStagingDir;
 static std::wstring g_BunDriveTarget;
+static std::vector<std::wstring> g_BunFallbackDirs;  // .bun fallback dirs to clean up
 
 static volatile LONG g_RestoreDone = 0;
 static volatile LONG g_PathAclModified = 0;
@@ -667,6 +679,54 @@ static void AutoEnableWaitForTuiIfNeeded() {
     }
 }
 
+// ========================================================================
+// Shell Compatibility for AppContainer
+// ========================================================================
+// Forward declaration (defined later in file)
+static void UpsertEnvOverride(const std::wstring& key, const std::wstring& value);
+
+// MSYS2-based shells (Git Bash, Cygwin bash) cannot run inside AppContainer
+// because they require creating kernel namespace objects under
+// \BaseNamedObjects\msys-2.0* which is blocked by the sandbox.
+// Detect and replace SHELL env var with cmd.exe automatically.
+// ========================================================================
+static bool IsMsys2OrCygwinPath(const std::wstring& path) {
+    if (path.empty()) return false;
+    std::wstring lower = ToLowerCopy(path);
+    // Git for Windows: ...\Git\usr\bin\bash.exe, ...\Git\bin\bash.exe
+    if (lower.find(L"\\git\\") != std::wstring::npos &&
+        lower.find(L"bash") != std::wstring::npos) return true;
+    // MSYS2: ...\msys64\usr\bin\bash.exe
+    if (lower.find(L"\\msys") != std::wstring::npos) return true;
+    // Cygwin: ...\cygwin64\bin\bash.exe
+    if (lower.find(L"\\cygwin") != std::wstring::npos) return true;
+    return false;
+}
+
+static void FixShellForAppContainer() {
+    std::wstring currentShell = GetEnvVarCopy(L"SHELL");
+    std::wstring comspec = GetEnvVarCopy(L"COMSPEC");
+    std::wstring safeShell = comspec.empty() ? L"C:\\Windows\\System32\\cmd.exe" : comspec;
+
+    // Case 1: SHELL points to MSYS2/Cygwin bash -> override with cmd.exe
+    if (!currentShell.empty() && IsMsys2OrCygwinPath(currentShell)) {
+        LogWarn(L"[ShellCompat] SHELL=%ls is MSYS2/Cygwin, incompatible with AppContainer.", currentShell.c_str());
+        UpsertEnvOverride(L"SHELL", safeShell);
+        UpsertEnvOverride(L"COMSPEC", safeShell);
+        LogInfo(L"[ShellCompat] Override SHELL=%ls for AppContainer compatibility.", safeShell.c_str());
+        return;
+    }
+
+    // Case 2: SHELL not set -> OpenCode/Node will search PATH and find bash.exe -> preempt
+    if (currentShell.empty()) {
+        UpsertEnvOverride(L"SHELL", safeShell);
+        LogInfo(L"[ShellCompat] SHELL was empty, set to %ls for AppContainer compatibility.", safeShell.c_str());
+        return;
+    }
+
+    LogDebug(L"[ShellCompat] SHELL=%ls appears safe, no override.", currentShell.c_str());
+}
+
 static bool ResolveSubstPath(const std::wstring& inputPath, std::wstring* resolvedPath) {
     if (!resolvedPath) return false;
 
@@ -812,7 +872,7 @@ static void ApplyDefaultOpenCodeEnvPaths() {
     SetEnvDefaultIfAbsent(L"HOME",            workDir);
     SetEnvDefaultIfAbsent(L"USERPROFILE",     workDir);
     SetEnvDefaultIfAbsent(L"APPDATA",         configDir);
-    SetEnvDefaultIfAbsent(L"LOCALAPPDATA",    exeDir);
+    SetEnvDefaultIfAbsent(L"LOCALAPPDATA",    dataDir);
     SetEnvDefaultIfAbsent(L"TEMP",            tempDir);
     SetEnvDefaultIfAbsent(L"TMP",             tempDir);
     SetEnvDefaultIfAbsent(L"XDG_CONFIG_HOME", configDir);
@@ -949,6 +1009,11 @@ static void PrintUsage() {
     wprintf(L"\t- Child shares current console window.\r\n");
     wprintf(L"\t- config.ini [App] is auto-loaded when no CLI args.\r\n");
     wprintf(L"\t- For bun/bun.exe, %%BUN_INSTALL%%\\root is auto-added to allowPaths and PATH.\r\n");
+    wprintf(L"\r\n");
+    wprintf(L"Network Filter (config.ini only):\r\n");
+    wprintf(L"\tnetworkFilterEnabled = true|false  (enable domain-based network filtering)\r\n");
+    wprintf(L"\tnetworkFilterPort = 8080           (local proxy port)\r\n");
+    wprintf(L"\tnetworkFilterAllowedUrls = *.example.com;api.other.com  (allowed domains)\r\n");
 }
 
 // ========================================================================
@@ -2589,6 +2654,84 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
     if (!dllDir.empty() && DirectoryExists(dllDir))
         LogInfo(L"[BunVFS]   2. DLL in PATH: %ls", dllDir.c_str());
 
+    // === Fallback 2: Copy DLL to %LOCALAPPDATA%\.bun\~BUN\root\ ===
+    // When B: drive is not visible inside AppContainer, Bun's runtime may
+    // fall back to loading DLLs from %LOCALAPPDATA%\.bun\~BUN\root\.
+    // We mirror the staging directory structure there.
+    // Also try exeDir\.bun\~BUN\root\ in case Bun resolves the exe directory.
+    if (!dllPath.empty()) {
+        std::wstring dllFileName = GetFileNamePart(dllPath);
+        std::wstring exeDir = GetExeDir();
+
+        // Try multiple candidate base directories for .bun fallback
+        std::wstring candidateBases[3];
+        int numCandidates = 0;
+
+        // Candidate 1: exeDir (where opencode.exe lives)
+        if (!exeDir.empty()) candidateBases[numCandidates++] = exeDir;
+
+        // Candidate 2: LOCALAPPDATA (from env overrides if set, otherwise from environment)
+        {
+            std::wstring localAppData;
+            for (const auto& ov : EnvOverrides) {
+                if (IEquals(ov.name, L"LOCALAPPDATA")) { localAppData = ov.value; break; }
+            }
+            if (localAppData.empty()) localAppData = GetEnvVarCopy(L"LOCALAPPDATA");
+            if (!localAppData.empty() && !IEquals(localAppData, exeDir))
+                candidateBases[numCandidates++] = localAppData;
+        }
+
+        // Candidate 3: AllowedPaths[0] (staging base, if different from above)
+        if (!AllowedPaths.empty() && !AllowedPaths[0].empty()) {
+            bool dup = false;
+            for (int i = 0; i < numCandidates; ++i) {
+                if (IEquals(AllowedPaths[0], candidateBases[i])) { dup = true; break; }
+            }
+            if (!dup) candidateBases[numCandidates++] = AllowedPaths[0];
+        }
+
+        LogInfo(L"[BunVFS] Fallback 2: Creating .bun mirror directories (%d candidates)...", numCandidates);
+
+        for (int i = 0; i < numCandidates; ++i) {
+            std::wstring bunFallbackBase = JoinPath(candidateBases[i], L".bun");
+            std::wstring bunFallbackBun  = JoinPath(bunFallbackBase, L"~BUN");
+            std::wstring bunFallbackRoot = JoinPath(bunFallbackBun, L"root");
+            std::wstring bunFallbackDll  = JoinPath(bunFallbackRoot, dllFileName);
+
+            CreateDirectoryW(bunFallbackBase.c_str(), nullptr);
+            CreateDirectoryW(bunFallbackBun.c_str(), nullptr);
+            CreateDirectoryW(bunFallbackRoot.c_str(), nullptr);
+
+            if (DirectoryExists(bunFallbackRoot)) {
+                // Copy DLL to fallback location (overwrite if exists)
+                if (CopyFileW(dllPath.c_str(), bunFallbackDll.c_str(), FALSE)) {
+                    LogInfo(L"[BunVFS]   Fallback 2[%d]: Copied DLL to %ls", i, bunFallbackDll.c_str());
+                    g_BunFallbackDirs.push_back(bunFallbackBase);
+
+                    // Add to PATH prepend
+                    if (AddPathPrependUnique(bunFallbackRoot)) {
+                        LogInfo(L"[BunVFS]   Fallback 2[%d]: Added to PATH: %ls", i, bunFallbackRoot.c_str());
+                    }
+
+                    // Grant AppContainer access to the .bun tree
+                    if (appContainerSid) {
+                        GrantFullControlToSidOnPath(bunFallbackBase.c_str(), appContainerSid);
+                    }
+
+                    // Add to allowed paths for ACL
+                    AddAllowedPathUnique(bunFallbackBase);
+                } else {
+                    DWORD copyErr = GetLastError();
+                    LogWarn(L"[BunVFS]   Fallback 2[%d]: CopyFile to %ls failed (err=%lu)", i, bunFallbackDll.c_str(), copyErr);
+                }
+            } else {
+                LogWarn(L"[BunVFS]   Fallback 2[%d]: Could not create directory: %ls", i, bunFallbackRoot.c_str());
+            }
+        }
+
+        LogInfo(L"[BunVFS]   3. .bun fallback directories: CONFIGURED");
+    }
+
     LogInfo(L"[BunVFS] ====== Bun Virtual Drive Setup Complete ======");
     return true;
 }
@@ -2634,6 +2777,20 @@ static void CleanupBunVirtualDrive() {
             LogWarn(L"[BunVFS/Cleanup] Failed to delete staging directory: %ls (err=%lu)", g_BunStagingDir.c_str(), dw);
         }
     }
+
+    // Step 3: Delete .bun fallback directories
+    for (const auto& fbDir : g_BunFallbackDirs) {
+        if (!fbDir.empty() && DirectoryExists(fbDir)) {
+            LogInfo(L"[BunVFS/Cleanup] Deleting .bun fallback: %ls", fbDir.c_str());
+            DWORD dw = DeleteTreeNoFollow(fbDir);
+            if (dw == ERROR_SUCCESS) {
+                LogInfo(L"[BunVFS/Cleanup] Fallback directory deleted: %ls", fbDir.c_str());
+            } else {
+                LogWarn(L"[BunVFS/Cleanup] Failed to delete fallback: %ls (err=%lu)", fbDir.c_str(), dw);
+            }
+        }
+    }
+    g_BunFallbackDirs.clear();
 }
 
 static void AtExitCleanupBunDrive() {
@@ -2748,6 +2905,372 @@ static bool BuildChildEnvBlockFromOverrides() {
 
 // ========================================================================
 // Process Launcher
+// ========================================================================
+// ========================================================================
+// Job Object Sandbox (Alternative to AppContainer)
+// ========================================================================
+// AppContainer blocks SetConsoleMode() which breaks TUI apps like OpenCode.
+// Job Object sandbox provides process isolation without console restrictions:
+//   - Restricted token: strips most privileges, adds restricted SIDs
+//   - Job Object: limits child process creation, UI access, system shutdown
+//   - The child CAN call SetConsoleMode (raw mode works!)
+// ========================================================================
+
+static HANDLE CreateRestrictedChildToken() {
+    HANDLE hCurToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY |
+                          TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, &hCurToken)) {
+        LogError(L"[JobSandbox] OpenProcessToken failed: err=%lu", GetLastError());
+        return nullptr;
+    }
+
+    // Duplicate as a primary token for CreateProcessAsUser
+    HANDLE hDupToken = nullptr;
+    if (!DuplicateTokenEx(hCurToken, MAXIMUM_ALLOWED, nullptr,
+                          SecurityImpersonation, TokenPrimary, &hDupToken)) {
+        LogError(L"[JobSandbox] DuplicateTokenEx failed: err=%lu", GetLastError());
+        CloseHandle(hCurToken);
+        return nullptr;
+    }
+    CloseHandle(hCurToken);
+
+    // Create restricted token: disable all privileges except SeChangeNotifyPrivilege
+    // DISABLE_MAX_PRIVILEGE strips everything except SeChangeNotifyPrivilege
+    HANDLE hRestrictedToken = nullptr;
+    if (!CreateRestrictedToken(hDupToken, DISABLE_MAX_PRIVILEGE,
+                               0, nullptr,   // no SIDs to disable
+                               0, nullptr,   // no privileges to delete (DISABLE_MAX_PRIVILEGE handles it)
+                               0, nullptr,   // no restricting SIDs
+                               &hRestrictedToken)) {
+        LogError(L"[JobSandbox] CreateRestrictedToken failed: err=%lu", GetLastError());
+        CloseHandle(hDupToken);
+        return nullptr;
+    }
+    CloseHandle(hDupToken);
+
+    LogInfo(L"[JobSandbox] Restricted token created (privileges stripped via DISABLE_MAX_PRIVILEGE).");
+    return hRestrictedToken;
+}
+
+static HANDLE CreateSandboxJobObject() {
+    // Create an anonymous Job Object
+    HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
+    if (!hJob) {
+        LogError(L"[JobSandbox] CreateJobObjectW failed: err=%lu", GetLastError());
+        return nullptr;
+    }
+
+    // === UI Restrictions ===
+    // Block: exit windows, clipboard write, user handles (other desktops),
+    //        system parameter changes, display setting changes, global atoms
+    JOBOBJECT_BASIC_UI_RESTRICTIONS uiRestrict{};
+    uiRestrict.UIRestrictionsClass =
+        JOB_OBJECT_UILIMIT_EXITWINDOWS       |
+        JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS   |
+        JOB_OBJECT_UILIMIT_DISPLAYSETTINGS    |
+        JOB_OBJECT_UILIMIT_GLOBALATOMS;
+    // NOTE: We do NOT set JOB_OBJECT_UILIMIT_HANDLES or JOB_OBJECT_UILIMIT_READCLIPBOARD
+    // because the child needs to interact with its console handles.
+
+    if (!SetInformationJobObject(hJob, JobObjectBasicUIRestrictions,
+                                  &uiRestrict, sizeof(uiRestrict))) {
+        LogWarn(L"[JobSandbox] SetInformationJobObject(UI) failed: err=%lu", GetLastError());
+    } else {
+        LogDebug(L"[JobSandbox] UI restrictions set (0x%lX).", uiRestrict.UIRestrictionsClass);
+    }
+
+    // === Extended Limits ===
+    // Prevent child from: escaping job, creating processes beyond limit
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION extLimit{};
+    extLimit.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |     // Kill all children when job handle closes
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+
+    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                  &extLimit, sizeof(extLimit))) {
+        LogWarn(L"[JobSandbox] SetInformationJobObject(ExtLimit) failed: err=%lu", GetLastError());
+    } else {
+        LogInfo(L"[JobSandbox] Extended limits set: KILL_ON_JOB_CLOSE, DIE_ON_UNHANDLED_EXCEPTION.");
+    }
+
+    LogInfo(L"[JobSandbox] Job Object created successfully.");
+    return hJob;
+}
+
+static DWORD LaunchProcessWithJobSandbox() {
+    DWORD result = ERROR_SUCCESS;
+
+    LogInfo(L"[JobLaunch] === Using Job Object Sandbox (not AppContainer) ===");
+    LogInfo(L"[JobLaunch]   Command: %ls", ExeToLaunch);
+    LogInfo(L"[JobLaunch]   Wait: %ls, NewConsole: %ls, ConPTY: %ls",
+            WaitForExit ? L"yes" : L"no", UseNewConsole ? L"yes" : L"no",
+            UseConPty ? L"yes" : L"no");
+
+    // --- Create restricted token ---
+    HANDLE hRestrictedToken = CreateRestrictedChildToken();
+    if (!hRestrictedToken) {
+        LogError(L"[JobLaunch] Failed to create restricted token. Aborting.");
+        return ERROR_ACCESS_DENIED;
+    }
+
+    // --- Create Job Object ---
+    g_hJobObject = CreateSandboxJobObject();
+    if (!g_hJobObject) {
+        LogWarn(L"[JobLaunch] Job Object creation failed. Proceeding without job limits.");
+    }
+
+    // --- ConPTY setup (same logic as AppContainer path) ---
+    bool useConPty = false;
+    void* hPC = nullptr;
+    HANDLE hPipeIn_R = nullptr, hPipeIn_W = nullptr;
+    HANDLE hPipeOut_R = nullptr, hPipeOut_W = nullptr;
+    HANDLE hRelayIn = nullptr, hRelayOut = nullptr, hStopEvent = nullptr;
+    InputRelayCtx inputCtx{};
+    DWORD savedInputMode = 0, savedOutputMode = 0;
+    bool inputModeChanged = false, outputModeChanged = false;
+
+    if (WaitForExit && !UseNewConsole && UseConPty && InitConPtyApi()) {
+        LogInfo(L"[JobLaunch] Setting up ConPTY pseudoconsole...");
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        BOOL pipeOk = CreatePipe(&hPipeIn_R, &hPipeIn_W, &sa, 0) &&
+                      CreatePipe(&hPipeOut_R, &hPipeOut_W, &sa, 0);
+        if (pipeOk) {
+            SetHandleInformation(hPipeIn_W, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(hPipeOut_R, HANDLE_FLAG_INHERIT, 0);
+            COORD conSize = GetCurrentConsoleSize();
+            HRESULT hr = g_pfnCreatePC(conSize, hPipeIn_R, hPipeOut_W, 0, &hPC);
+            if (SUCCEEDED(hr)) {
+                useConPty = true;
+                LogInfo(L"[JobLaunch] ConPTY created: %dx%d", conSize.X, conSize.Y);
+            } else {
+                LogWarn(L"[JobLaunch] CreatePseudoConsole failed: hr=0x%08lX", (DWORD)hr);
+            }
+        }
+        if (hPipeIn_R)  { CloseHandle(hPipeIn_R);  hPipeIn_R = nullptr; }
+        if (hPipeOut_W) { CloseHandle(hPipeOut_W); hPipeOut_W = nullptr; }
+        if (!useConPty) {
+            if (hPipeIn_W)  { CloseHandle(hPipeIn_W);  hPipeIn_W = nullptr; }
+            if (hPipeOut_R) { CloseHandle(hPipeOut_R); hPipeOut_R = nullptr; }
+        }
+    }
+
+    // --- Pre-set raw mode for shared console (same as AppContainer path) ---
+    if (!useConPty && !UseNewConsole && WaitForExit) {
+        LogInfo(L"[JobLaunch] Pre-setting console raw mode for TUI...");
+        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+        HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hStdin != INVALID_HANDLE_VALUE && GetConsoleMode(hStdin, &savedInputMode)) {
+            DWORD newMode = ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if (SetConsoleMode(hStdin, newMode)) {
+                inputModeChanged = true;
+                LogInfo(L"[JobLaunch] Console input: raw mode (0x%lX -> 0x%lX)", savedInputMode, newMode);
+            }
+        }
+        if (hStdout != INVALID_HANDLE_VALUE && GetConsoleMode(hStdout, &savedOutputMode)) {
+            DWORD newMode = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+            if (SetConsoleMode(hStdout, newMode)) {
+                outputModeChanged = true;
+                LogInfo(L"[JobLaunch] Console output: VT mode (0x%lX -> 0x%lX)", savedOutputMode, newMode);
+            }
+        }
+    }
+
+    // --- Build attribute list ---
+    DWORD attributeCount = 0;
+    if (useConPty) ++attributeCount;
+
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList = nullptr;
+    if (attributeCount > 0) {
+        SIZE_T attrListSize = 0;
+        InitializeProcThreadAttributeList(nullptr, attributeCount, 0, &attrListSize);
+        attrList = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(HeapAlloc(GetProcessHeap(), 0, attrListSize));
+        if (!attrList) {
+            LogError(L"[JobLaunch] HeapAlloc for attribute list failed.");
+            CloseHandle(hRestrictedToken);
+            return ERROR_OUTOFMEMORY;
+        }
+        if (!InitializeProcThreadAttributeList(attrList, attributeCount, 0, &attrListSize)) {
+            result = GetLastError();
+            LogError(L"[JobLaunch] InitializeProcThreadAttributeList failed: err=%lu", result);
+            HeapFree(GetProcessHeap(), 0, attrList);
+            CloseHandle(hRestrictedToken);
+            return result;
+        }
+        if (useConPty && hPC) {
+            if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                           hPC, sizeof(hPC), nullptr, nullptr)) {
+                result = GetLastError();
+                LogError(L"[JobLaunch] UpdateProcThreadAttribute(PSEUDOCONSOLE) failed: err=%lu", result);
+                DeleteProcThreadAttributeList(attrList);
+                HeapFree(GetProcessHeap(), 0, attrList);
+                CloseHandle(hRestrictedToken);
+                return result;
+            }
+            LogDebug(L"[JobLaunch] Pseudoconsole attribute set.");
+        }
+    }
+
+    // --- Create process ---
+    STARTUPINFOEXW si{};
+    PROCESS_INFORMATION pi{};
+    si.StartupInfo.cb = sizeof(si);
+    if (attrList) si.lpAttributeList = attrList;
+
+    DWORD createFlags = 0;
+    if (attrList) createFlags |= EXTENDED_STARTUPINFO_PRESENT;
+    LPVOID envBlock = nullptr;
+    if (!g_ChildEnv.empty()) { envBlock = g_ChildEnv.data(); createFlags |= CREATE_UNICODE_ENVIRONMENT; }
+    if (UseNewConsole && !useConPty) createFlags |= CREATE_NEW_CONSOLE;
+    // CREATE_SUSPENDED so we can assign to Job before the child runs
+    createFlags |= CREATE_SUSPENDED;
+
+    LogInfo(L"[JobLaunch] Calling CreateProcessAsUserW (flags=0x%08lX, envBlock=%ls)...",
+            createFlags, envBlock ? L"custom" : L"inherited");
+
+    BOOL procOk = CreateProcessAsUserW(
+        hRestrictedToken,
+        nullptr,                // lpApplicationName
+        ExeToLaunch,           // lpCommandLine
+        nullptr, nullptr,       // lpProcessAttributes, lpThreadAttributes
+        FALSE,                  // bInheritHandles
+        createFlags,
+        envBlock,
+        nullptr,                // lpCurrentDirectory
+        &si.StartupInfo,
+        &pi);
+
+    if (!procOk) {
+        DWORD firstErr = GetLastError();
+        LogWarn(L"[JobLaunch] CreateProcessAsUserW failed: err=%lu", firstErr);
+
+        if (firstErr == ERROR_PRIVILEGE_NOT_HELD || firstErr == ERROR_ACCESS_DENIED) {
+            // Fallback: CreateProcessW without restricted token, rely on Job Object only
+            LogWarn(L"[JobLaunch] Falling back to CreateProcessW (Job Object only, no restricted token).");
+            procOk = CreateProcessW(
+                nullptr, ExeToLaunch, nullptr, nullptr, FALSE,
+                createFlags, envBlock, nullptr, &si.StartupInfo, &pi);
+            if (!procOk) {
+                result = GetLastError();
+                LogError(L"[JobLaunch] CreateProcessW also FAILED: err=%lu", result);
+            } else {
+                LogInfo(L"[JobLaunch] CreateProcessW succeeded (Job Object sandbox only).");
+            }
+        } else {
+            result = firstErr;
+            LogError(L"[JobLaunch] Hint: err=%lu", result);
+        }
+    }
+
+    CloseHandle(hRestrictedToken);
+    hRestrictedToken = nullptr;
+
+    if (!procOk) {
+        if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
+        return result;
+    }
+
+    wprintf(L"Successfully started sandboxed process, pid: %lu\r\n", pi.dwProcessId);
+    LogInfo(L"[JobLaunch] Process created (SUSPENDED): PID=%lu, TID=%lu", pi.dwProcessId, pi.dwThreadId);
+
+    // --- Assign to Job Object BEFORE resuming ---
+    if (g_hJobObject) {
+        if (AssignProcessToJobObject(g_hJobObject, pi.hProcess)) {
+            LogInfo(L"[JobLaunch] Process assigned to Job Object.");
+        } else {
+            LogWarn(L"[JobLaunch] AssignProcessToJobObject failed: err=%lu", GetLastError());
+        }
+    }
+
+    // Resume the child
+    ResumeThread(pi.hThread);
+    LogInfo(L"[JobLaunch] Child process resumed.");
+
+    // --- Hide parent console (same logic) ---
+    if (HideParentConsole && UseNewConsole && WaitForExit) {
+        DWORD pids[16] = {};
+        DWORD procCount = GetConsoleProcessList(pids, _countof(pids));
+        if (procCount <= 1) {
+            HWND hwnd = GetConsoleWindow();
+            if (hwnd) {
+                ShowWindow(hwnd, SW_HIDE);
+                LogInfo(L"[JobLaunch] Parent console window hidden.");
+            }
+        }
+    }
+
+    // --- ConPTY relay threads ---
+    if (useConPty) {
+        LogDebug(L"[JobLaunch] Setting up ConPTY relay threads...");
+        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+        HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (GetConsoleMode(hStdin, &savedInputMode)) {
+            SetConsoleMode(hStdin, ENABLE_VIRTUAL_TERMINAL_INPUT);
+            inputModeChanged = true;
+        }
+        if (GetConsoleMode(hStdout, &savedOutputMode)) {
+            DWORD newMode = savedOutputMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+            SetConsoleMode(hStdout, newMode);
+            outputModeChanged = true;
+        }
+        hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        hRelayOut = CreateThread(nullptr, 0, ConPtyOutputRelay, hPipeOut_R, 0, nullptr);
+        inputCtx.hPipeWrite = hPipeIn_W;
+        inputCtx.hStopEvent = hStopEvent;
+        hRelayIn = CreateThread(nullptr, 0, ConPtyInputRelay, &inputCtx, 0, nullptr);
+        LogInfo(L"[JobLaunch] ConPTY relay threads started.");
+    }
+
+    // --- Wait for exit ---
+    if (WaitForExit) {
+        LogInfo(L"[JobLaunch] Waiting for child process (PID=%lu) to exit...", pi.dwProcessId);
+        DWORD waitStart = GetTickCount();
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD waitElapsed = GetTickCount() - waitStart;
+
+        DWORD code = 0;
+        if (GetExitCodeProcess(pi.hProcess, &code)) {
+            result = code;
+            LogInfo(L"[JobLaunch] Child exited: code=%lu (0x%08lX), runtime=%lu ms", code, code, waitElapsed);
+        } else {
+            result = GetLastError();
+            LogWarn(L"[JobLaunch] GetExitCodeProcess failed: err=%lu", result);
+        }
+
+        // Cleanup ConPTY
+        if (useConPty) {
+            if (hStopEvent) SetEvent(hStopEvent);
+            if (hPC) { g_pfnClosePC(hPC); hPC = nullptr; }
+            if (hRelayOut) { WaitForSingleObject(hRelayOut, 5000); CloseHandle(hRelayOut); }
+            if (hRelayIn)  { WaitForSingleObject(hRelayIn, 2000);  CloseHandle(hRelayIn); }
+            if (hPipeIn_W)  CloseHandle(hPipeIn_W);
+            if (hPipeOut_R) CloseHandle(hPipeOut_R);
+            if (hStopEvent) CloseHandle(hStopEvent);
+        }
+
+        // Restore console modes
+        if (inputModeChanged) {
+            SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), savedInputMode);
+            LogDebug(L"[JobLaunch] Restored console input mode: 0x%lX", savedInputMode);
+        }
+        if (outputModeChanged) {
+            SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), savedOutputMode);
+            LogDebug(L"[JobLaunch] Restored console output mode: 0x%lX", savedOutputMode);
+        }
+    }
+
+    if (pi.hThread) CloseHandle(pi.hThread);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (attrList) { DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); }
+    if (hPC) g_pfnClosePC(hPC);
+
+    LogDebug(L"[JobLaunch] LaunchProcessWithJobSandbox returning: %lu", result);
+    return result;
+}
+
+// ========================================================================
+// Launch Process (AppContainer mode - original)
 // ========================================================================
 static DWORD LaunchProcess(PSID packageSid) {
     DWORD result = ERROR_SUCCESS;
@@ -3045,6 +3568,34 @@ static DWORD LaunchProcess(PSID packageSid) {
 }
 
 // ========================================================================
+// Network Filter URL Parsing
+// ========================================================================
+static std::vector<std::wstring> ParseNetworkFilterUrls(const std::wstring& raw) {
+    std::vector<std::wstring> result;
+    if (raw.empty()) return result;
+
+    // 支持分号和逗号分隔
+    std::wstring current;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        wchar_t ch = raw[i];
+        if (ch == L';' || ch == L',') {
+            std::wstring trimmed = TrimCopy(current);
+            if (!trimmed.empty()) {
+                result.push_back(trimmed);
+            }
+            current.clear();
+        } else {
+            current += ch;
+        }
+    }
+    std::wstring trimmed = TrimCopy(current);
+    if (!trimmed.empty()) {
+        result.push_back(trimmed);
+    }
+    return result;
+}
+
+// ========================================================================
 // Exe Dir / INI Config
 // ========================================================================
 static std::wstring GetExeDir() {
@@ -3123,12 +3674,93 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
     UseConPty = IniBoolFromString(ReadIniString(ini, L"conpty"), UseConPty);
     HideParentConsole = IniBoolFromString(ReadIniString(ini, L"hideParentConsole"), HideParentConsole);
     g_LogEnabled = IniBoolFromString(ReadIniString(ini, L"log"), g_LogEnabled);
+    UseJobSandbox = IniBoolFromString(ReadIniString(ini, L"jobSandbox"), UseJobSandbox);
+
+    // --- Network Filter config ---
+    g_NetworkFilterEnabled = IniBoolFromString(
+        ReadIniString(ini, L"networkFilterEnabled"), g_NetworkFilterEnabled);
+
+    auto nfPort = TrimCopy(ReadIniString(ini, L"networkFilterPort"));
+    if (!nfPort.empty()) {
+        int p = _wtoi(nfPort.c_str());
+        if (p > 0 && p <= 65535) {
+            g_NetworkFilterPort = p;
+        } else {
+            LogWarn(L"[Config] Invalid networkFilterPort: %ls, using default %d",
+                    nfPort.c_str(), g_NetworkFilterPort);
+        }
+    }
+
+    g_NetworkFilterAllowedUrls = TrimCopy(ReadIniString(ini, L"networkFilterAllowedUrls"));
+
+    LogInfo(L"[Config] networkFilter: enabled=%d, port=%d, allowedUrls=%ls",
+            g_NetworkFilterEnabled ? 1 : 0, g_NetworkFilterPort,
+            g_NetworkFilterAllowedUrls.empty() ? L"(none)" : g_NetworkFilterAllowedUrls.c_str());
 
     LogInfo(L"[Config] Final flags: wait=%d, retainProfile=%d, lpac=%d, noWin32k=%d, "
-            L"lowIntegrityOnPaths=%d, cleanupSubdirs=%d, newConsole=%d, conpty=%d, hideParent=%d, log=%d",
+            L"lowIntegrityOnPaths=%d, cleanupSubdirs=%d, newConsole=%d, conpty=%d, hideParent=%d, log=%d, jobSandbox=%d, networkFilter=%d",
             WaitForExit?1:0, RetainProfile?1:0, LaunchAsLpac?1:0, NoWin32k?1:0,
-            PathLowIntegrity?1:0, CleanupAllowedSubdirs?1:0, UseNewConsole?1:0, UseConPty?1:0, HideParentConsole?1:0, g_LogEnabled?1:0);
+            PathLowIntegrity?1:0, CleanupAllowedSubdirs?1:0, UseNewConsole?1:0, UseConPty?1:0, HideParentConsole?1:0, g_LogEnabled?1:0, UseJobSandbox?1:0, g_NetworkFilterEnabled?1:0);
     return true;
+}
+
+// ========================================================================
+// Network Filter Plugin Integration
+// ========================================================================
+static bool InitializeNetworkFilter() {
+    if (!g_NetworkFilterEnabled) {
+        LogDebug(L"[NetworkFilter] Disabled, skipping initialization.");
+        return true;  // Not an error
+    }
+
+    // Parse allowed domains
+    auto domains = ParseNetworkFilterUrls(g_NetworkFilterAllowedUrls);
+    if (domains.empty()) {
+        LogWarn(L"[NetworkFilter] Enabled but no allowed URLs configured. "
+                L"All network requests will be BLOCKED.");
+    }
+
+    // Configure allowed domains
+    NetworkFilterPlugin::SetAllowedDomains(domains);
+
+    // Start the proxy
+    if (!NetworkFilterPlugin::Initialize(g_NetworkFilterPort)) {
+        LogError(L"[NetworkFilter] Failed to initialize proxy on port %d", g_NetworkFilterPort);
+        return false;
+    }
+
+    LogInfo(L"[NetworkFilter] Proxy started on %ls",
+            NetworkFilterPlugin::GetProxyUrl().c_str());
+
+    return true;
+}
+
+static void ShutdownNetworkFilter() {
+    if (g_NetworkFilterEnabled && NetworkFilterPlugin::IsRunning()) {
+        LogInfo(L"[NetworkFilter] Shutting down proxy...");
+        NetworkFilterPlugin::Shutdown();
+        LogInfo(L"[NetworkFilter] Proxy stopped.");
+    }
+}
+
+static void InjectProxyEnvVars() {
+    if (!g_NetworkFilterEnabled || !NetworkFilterPlugin::IsRunning()) {
+        return;
+    }
+
+    std::wstring proxyUrl = NetworkFilterPlugin::GetProxyUrl();
+
+    // Set standard proxy environment variables (both cases for compatibility)
+    UpsertEnvOverride(L"HTTP_PROXY",  proxyUrl);
+    UpsertEnvOverride(L"HTTPS_PROXY", proxyUrl);
+    UpsertEnvOverride(L"http_proxy",  proxyUrl);
+    UpsertEnvOverride(L"https_proxy", proxyUrl);
+
+    // Exclude localhost to prevent proxy self-loop
+    UpsertEnvOverride(L"NO_PROXY",  L"localhost,127.0.0.1");
+    UpsertEnvOverride(L"no_proxy",  L"localhost,127.0.0.1");
+
+    LogInfo(L"[NetworkFilter] Injected proxy env vars: %ls", proxyUrl.c_str());
 }
 
 // ========================================================================
@@ -3138,6 +3770,7 @@ static BOOL WINAPI OnConsoleCtrl(DWORD ctrlType) {
     switch (ctrlType) {
     case CTRL_CLOSE_EVENT: case CTRL_LOGOFF_EVENT: case CTRL_SHUTDOWN_EVENT:
         LogWarn(L"[Console] Close/logoff/shutdown event (type=%lu). Cleaning up...", ctrlType);
+        ShutdownNetworkFilter();
         CleanupBunVirtualDrive();
         RestoreSavedSecurityOnce();
         LogInfo(L"[Console] Cleanup complete for console event %lu.", ctrlType);
@@ -3201,6 +3834,7 @@ int wmain(int argc, WCHAR** argv) {
     ApplyDefaultOpenCodeEnvPaths();
     ApplyBunOpenTuiCompatibility();
     AutoEnableWaitForTuiIfNeeded();
+    FixShellForAppContainer();
 
     if (WaitForExit) {
         UpsertEnvOverride(L"TERM", L"xterm-256color");
@@ -3222,67 +3856,122 @@ int wmain(int argc, WCHAR** argv) {
     SetConsoleOutputCP(CP_UTF8);
     LogInfo(L"[Init] Console code page set to UTF-8 (65001).");
 
-    LogInfo(L"[Phase] Creating AppContainer profile...");
-    result = CreateAppContainerProfileWithMoniker(&appContainerSid);
-    if (result != ERROR_SUCCESS) {
-        LogError(L"[Phase] Failed to create AppContainer profile: err=%lu", result);
-        goto Cleanup;
-    }
-
-    if (!AllowedPaths.empty()) {
-        LogInfo(L"[Phase] Granting access to allowed paths...");
-        GrantAccessToAllowedPaths(appContainerSid);
-    }
-
-    // Prepare Bun virtual B: drive
-    LogInfo(L"[Phase] Checking/preparing Bun virtual drive...");
-    PrepareBunVirtualDrive(appContainerSid);
-    atexit(AtExitCleanupBunDrive);
-    SetUnhandledExceptionFilter(BunDriveCrashHandler);
-    LogDebug(L"[Phase] atexit and crash handlers registered for B: drive cleanup.");
-
-    // Build child environment block AFTER PrepareBunVirtualDrive() so that
-    // any PATH prepends and env overrides added during BunVFS setup are included.
-    if (!EnvOverrides.empty() || !PathPrependEntries.empty()) {
-        LogInfo(L"[Phase] Building child environment block (post-BunVFS)...");
-        BuildChildEnvBlockFromOverrides();
-    }
-
-    LogInfo(L"[Phase] Launching child process...");
-    result = LaunchProcess(appContainerSid);
-    LogInfo(L"[Phase] Child process finished with result: %lu (0x%08lX)", result, result);
-
-    if (CleanupAllowedSubdirs && (WaitForExit || result != ERROR_SUCCESS)) {
-        LogInfo(L"[Phase] Cleaning subdirectories under allowed paths...");
-        CleanupAllowedPathSubdirs();
-    }
-
-    if (InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
-        if (WaitForExit || result != ERROR_SUCCESS) {
-            LogInfo(L"[Phase] Reverting ACL/permissions...");
-            RestoreSavedSecurityOnce();
-        } else {
-            LogDebug(L"[Phase] ACLs were modified but wait=false and process succeeded. Deferring restore.");
+    // ================================================================
+    // Network Filter Plugin: Initialize proxy before child process
+    // ================================================================
+    if (g_NetworkFilterEnabled) {
+        LogInfo(L"[Phase] Initializing Network Filter Plugin...");
+        if (!InitializeNetworkFilter()) {
+            LogError(L"[Phase] Network filter initialization failed. Aborting.");
+            SetConsoleCtrlHandler(OnConsoleCtrl, FALSE);
+            CloseLogFile();
+            return 1;
         }
+        // Inject HTTP_PROXY / HTTPS_PROXY into env overrides.
+        // Must be done BEFORE BuildChildEnvBlockFromOverrides().
+        InjectProxyEnvVars();
     }
+
+    // ================================================================
+    // Branch: Job Object Sandbox vs AppContainer
+    // ================================================================
+    if (UseJobSandbox) {
+        LogInfo(L"[Phase] *** Job Object Sandbox mode enabled ***");
+        LogInfo(L"[Phase] Skipping AppContainer profile (using restricted token + job instead).");
+
+        // Prepare Bun virtual B: drive (pass nullptr for SID - no ACL granting needed)
+        LogInfo(L"[Phase] Checking/preparing Bun virtual drive...");
+        PrepareBunVirtualDrive(nullptr);
+        atexit(AtExitCleanupBunDrive);
+        SetUnhandledExceptionFilter(BunDriveCrashHandler);
+
+        // Build child environment block
+        if (!EnvOverrides.empty() || !PathPrependEntries.empty()) {
+            LogInfo(L"[Phase] Building child environment block (post-BunVFS)...");
+            BuildChildEnvBlockFromOverrides();
+        }
+
+        LogInfo(L"[Phase] Launching child process (Job sandbox)...");
+        result = LaunchProcessWithJobSandbox();
+        LogInfo(L"[Phase] Child process finished with result: %lu (0x%08lX)", result, result);
+
+        // Cleanup
+        LogInfo(L"[Phase] Entering cleanup...");
+        ShutdownNetworkFilter();
+        CleanupBunVirtualDrive();
+
+        if (g_hJobObject) {
+            CloseHandle(g_hJobObject);
+            g_hJobObject = nullptr;
+            LogDebug(L"[Phase] Job Object handle closed.");
+        }
+
+    } else {
+        // --- Original AppContainer path ---
+        LogInfo(L"[Phase] Creating AppContainer profile...");
+        result = CreateAppContainerProfileWithMoniker(&appContainerSid);
+        if (result != ERROR_SUCCESS) {
+            LogError(L"[Phase] Failed to create AppContainer profile: err=%lu", result);
+            goto Cleanup;
+        }
+
+        if (!AllowedPaths.empty()) {
+            LogInfo(L"[Phase] Granting access to allowed paths...");
+            GrantAccessToAllowedPaths(appContainerSid);
+        }
+
+        // Prepare Bun virtual B: drive
+        LogInfo(L"[Phase] Checking/preparing Bun virtual drive...");
+        PrepareBunVirtualDrive(appContainerSid);
+        atexit(AtExitCleanupBunDrive);
+        SetUnhandledExceptionFilter(BunDriveCrashHandler);
+        LogDebug(L"[Phase] atexit and crash handlers registered for B: drive cleanup.");
+
+        // Build child environment block AFTER PrepareBunVirtualDrive() so that
+        // any PATH prepends and env overrides added during BunVFS setup are included.
+        if (!EnvOverrides.empty() || !PathPrependEntries.empty()) {
+            LogInfo(L"[Phase] Building child environment block (post-BunVFS)...");
+            BuildChildEnvBlockFromOverrides();
+        }
+
+        LogInfo(L"[Phase] Launching child process...");
+        result = LaunchProcess(appContainerSid);
+        LogInfo(L"[Phase] Child process finished with result: %lu (0x%08lX)", result, result);
+
+        if (CleanupAllowedSubdirs && (WaitForExit || result != ERROR_SUCCESS)) {
+            LogInfo(L"[Phase] Cleaning subdirectories under allowed paths...");
+            CleanupAllowedPathSubdirs();
+        }
+
+        if (InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
+            if (WaitForExit || result != ERROR_SUCCESS) {
+                LogInfo(L"[Phase] Reverting ACL/permissions...");
+                RestoreSavedSecurityOnce();
+            } else {
+                LogDebug(L"[Phase] ACLs were modified but wait=false and process succeeded. Deferring restore.");
+            }
+        }
 
 Cleanup:
-    LogInfo(L"[Phase] Entering cleanup...");
+        LogInfo(L"[Phase] Entering cleanup...");
+        ShutdownNetworkFilter();
 
-    // Remove B: drive mapping
-    CleanupBunVirtualDrive();
+        // Remove B: drive mapping
+        CleanupBunVirtualDrive();
 
-    if (result != ERROR_SUCCESS && InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
-        LogInfo(L"[Phase] Error path: restoring ACLs...");
-        RestoreSavedSecurityOnce();
+        if (result != ERROR_SUCCESS && InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
+            LogInfo(L"[Phase] Error path: restoring ACLs...");
+            RestoreSavedSecurityOnce();
+        }
+        if (WaitForExit && !RetainProfile && g_ProfileWasCreated) {
+            LogInfo(L"[Phase] Deleting AppContainer profile...");
+            DeleteAppContainerProfileWithMoniker();
+        } else if (RetainProfile) {
+            LogInfo(L"[Phase] Retaining AppContainer profile (retainProfile=true).");
+        }
+        if (appContainerSid) { FreeSid(appContainerSid); appContainerSid = nullptr; }
     }
-    if (WaitForExit && !RetainProfile && g_ProfileWasCreated) {
-        LogInfo(L"[Phase] Deleting AppContainer profile...");
-        DeleteAppContainerProfileWithMoniker();
-    } else if (RetainProfile) {
-        LogInfo(L"[Phase] Retaining AppContainer profile (retainProfile=true).");
-    }
-    if (appContainerSid) { FreeSid(appContainerSid); appContainerSid = nullptr; }
+
     SetConsoleCtrlHandler(OnConsoleCtrl, FALSE);
 
     LogInfo(L"========================================");
