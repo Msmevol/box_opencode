@@ -2,6 +2,8 @@
 
 #include <string>
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 // Sandbox log functions (writes to main sandbox log)
 extern void LogInfo(const wchar_t* fmt, ...);
@@ -22,13 +24,15 @@ struct DomainPattern {
 };
 
 struct NetworkFilterState {
-    bool running;
+    std::atomic<bool> running;
+    std::atomic<int> activeConnections;
     int port;
     std::vector<DomainPattern> allowedDomains;
     void* listenSocket;
     void* serverThread;
+    std::mutex mutex;
     
-    NetworkFilterState() : running(false), port(8080), listenSocket(nullptr), serverThread(nullptr) {}
+    NetworkFilterState() : running(false), activeConnections(0), port(8080), listenSocket(nullptr), serverThread(nullptr) {}
 };
 
 class NetworkFilterPlugin {

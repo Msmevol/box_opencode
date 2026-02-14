@@ -7,6 +7,7 @@
 #include <UserEnv.h>
 #include <sddl.h>
 #include <Aclapi.h>
+#include <WinSafer.h>
 
 #include <algorithm>
 #include <cstdarg>
@@ -64,6 +65,18 @@ struct EnvKV {
     std::wstring value;
 };
 
+enum class PathAccessLevel {
+    ReadOnly,
+    ReadExecute,
+    ReadWrite,
+    FullControl
+};
+
+struct AllowedPathEntry {
+    std::wstring path;
+    PathAccessLevel accessLevel;
+};
+
 struct SavedSecurity {
     std::wstring path;
     PSECURITY_DESCRIPTOR sdDacl = nullptr;
@@ -74,10 +87,55 @@ struct SavedSecurity {
     PSECURITY_DESCRIPTOR sdSacl = nullptr;
     PACL sacl = nullptr;
     bool hasSacl = false;
+    
+    ~SavedSecurity() {
+        if (sdDacl) { LocalFree(sdDacl); sdDacl = nullptr; }
+        if (sdSacl) { LocalFree(sdSacl); sdSacl = nullptr; }
+    }
+    
+    SavedSecurity() = default;
+    SavedSecurity(const SavedSecurity&) = delete;
+    SavedSecurity& operator=(const SavedSecurity&) = delete;
+    SavedSecurity(SavedSecurity&& other) noexcept 
+        : path(std::move(other.path)), sdDacl(other.sdDacl), dacl(other.dacl),
+          hasDacl(other.hasDacl), daclProtected(other.daclProtected),
+          sdSacl(other.sdSacl), sacl(other.sacl), hasSacl(other.hasSacl) {
+        other.sdDacl = nullptr; other.sdSacl = nullptr;
+    }
+    SavedSecurity& operator=(SavedSecurity&& other) noexcept {
+        if (this != &other) {
+            if (sdDacl) LocalFree(sdDacl);
+            if (sdSacl) LocalFree(sdSacl);
+            path = std::move(other.path);
+            sdDacl = other.sdDacl; dacl = other.dacl;
+            hasDacl = other.hasDacl; daclProtected = other.daclProtected;
+            sdSacl = other.sdSacl; sacl = other.sacl; hasSacl = other.hasSacl;
+            other.sdDacl = nullptr; other.sdSacl = nullptr;
+        }
+        return *this;
+    }
 };
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
+#endif
+#ifndef PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY
+#define PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY 0x00020019
+#endif
+#ifndef PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY
+#define PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY 0x0002001A
+#endif
+#ifndef PROCESS_CREATION_CHILD_PROCESS_RESTRICTED
+#define PROCESS_CREATION_CHILD_PROCESS_RESTRICTED 0x01
+#endif
+#ifndef PROCESS_CREATION_CHILD_PROCESS_OVERRIDE
+#define PROCESS_CREATION_CHILD_PROCESS_OVERRIDE 0x02
+#endif
+#ifndef PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_ENABLE_PROCESS_TREE
+#define PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_ENABLE_PROCESS_TREE 0x01
+#endif
+#ifndef PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE
+#define PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE 0x04
 #endif
 #ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
 #define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
@@ -98,7 +156,7 @@ static std::wstring PackageMoniker;
 static std::wstring PackageDisplayName;
 
 static std::vector<SidAttrWrap> CapabilityList;
-static std::vector<std::wstring> AllowedPaths;
+static std::vector<AllowedPathEntry> AllowedPaths;
 static std::vector<EnvKV> EnvOverrides;
 static std::vector<std::wstring> PathPrependEntries;
 static std::vector<SavedSecurity> g_SavedSecurity;
@@ -110,7 +168,10 @@ static bool WaitForExit = true;
 static bool RetainProfile = false;
 static bool LaunchAsLpac = false;
 static bool NoWin32k = false;
+static bool AllowChildProcess = false;
 static bool PathLowIntegrity = true;
+static bool UseRestrictedToken = false;
+static int IntegrityLevel = 0;  // 0=Low(4096), 1=Medium(8192), 2=High(12288)
 static bool g_ProfileWasCreated = false;
 static bool CleanupAllowedSubdirs = false;
 static bool g_WaitAutoEnabled = false;
@@ -516,7 +577,16 @@ static bool PathEqualsInsensitive(const std::wstring& a, const std::wstring& b) 
     return _wcsicmp(na.c_str(), nb.c_str()) == 0;
 }
 
-static bool VectorHasPathInsensitive(const std::vector<std::wstring>& list, const std::wstring& path) {
+static bool VectorHasPathInsensitive(const std::vector<AllowedPathEntry>& list, const std::wstring& path) {
+    for (const auto& item : list) {
+        if (PathEqualsInsensitive(item.path, path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool VectorHasPathInsensitiveWStr(const std::vector<std::wstring>& list, const std::wstring& path) {
     for (const auto& item : list) {
         if (PathEqualsInsensitive(item, path)) {
             return true;
@@ -525,18 +595,18 @@ static bool VectorHasPathInsensitive(const std::vector<std::wstring>& list, cons
     return false;
 }
 
-static bool AddAllowedPathUnique(const std::wstring& path) {
+static bool AddAllowedPathUnique(const std::wstring& path, PathAccessLevel level = PathAccessLevel::FullControl) {
     std::wstring p = TrimCopy(path);
     if (p.empty()) return false;
     if (VectorHasPathInsensitive(AllowedPaths, p)) return false;
-    AllowedPaths.emplace_back(p);
+    AllowedPaths.push_back({ p, level });
     return true;
 }
 
 static bool AddPathPrependUnique(const std::wstring& path) {
     std::wstring p = TrimCopy(path);
     if (p.empty()) return false;
-    if (VectorHasPathInsensitive(PathPrependEntries, p)) return false;
+    if (VectorHasPathInsensitiveWStr(PathPrependEntries, p)) return false;
     PathPrependEntries.emplace_back(p);
     return true;
 }
@@ -575,66 +645,78 @@ static void ClearReadOnlyAttributeIfSet(const std::wstring& path) {
 }
 
 static DWORD DeleteTreeNoFollow(const std::wstring& path) {
-    DWORD attrs = GetFileAttributesW(path.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
-        DWORD e = GetLastError();
-        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
-        return e;
-    }
+    std::vector<std::wstring> dirsToDelete;
+    dirsToDelete.push_back(path);
+    
+    while (!dirsToDelete.empty()) {
+        std::wstring currentPath = std::move(dirsToDelete.back());
+        dirsToDelete.pop_back();
+        
+        DWORD attrs = GetFileAttributesW(currentPath.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) continue;
+            return e;
+        }
 
-    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        ClearReadOnlyAttributeIfSet(path);
-        if (DeleteFileW(path.c_str())) return ERROR_SUCCESS;
-        DWORD e = GetLastError();
-        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
-        return e;
-    }
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            ClearReadOnlyAttributeIfSet(currentPath);
+            if (DeleteFileW(currentPath.c_str())) continue;
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) continue;
+            return e;
+        }
 
-    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
-        ClearReadOnlyAttributeIfSet(path);
-        if (RemoveDirectoryW(path.c_str())) return ERROR_SUCCESS;
-        DWORD e = GetLastError();
-        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
-        return e;
-    }
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+            ClearReadOnlyAttributeIfSet(currentPath);
+            if (RemoveDirectoryW(currentPath.c_str())) continue;
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) continue;
+            return e;
+        }
 
-    std::wstring search = path;
-    if (!search.empty() && search.back() != L'\\') search.push_back(L'\\');
-    search.append(L"*");
+        std::wstring search = currentPath;
+        if (!search.empty() && search.back() != L'\\') search.push_back(L'\\');
+        search.append(L"*");
 
-    WIN32_FIND_DATAW fd{};
-    HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (IsDotOrDotDot(fd.cFileName)) continue;
-            std::wstring child = path;
-            if (!child.empty() && child.back() != L'\\') child.push_back(L'\\');
-            child.append(fd.cFileName);
+        WIN32_FIND_DATAW fd{};
+        HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            std::vector<std::wstring> subItems;
+            do {
+                if (IsDotOrDotDot(fd.cFileName)) continue;
+                std::wstring child = currentPath;
+                if (!child.empty() && child.back() != L'\\') child.push_back(L'\\');
+                child.append(fd.cFileName);
+                subItems.push_back(std::move(child));
+            } while (FindNextFileW(hFind, &fd));
 
-            DWORD dw = DeleteTreeNoFollow(child);
-            if (dw != ERROR_SUCCESS) {
-                LogWarn(L"DeleteTree failed on %ls (%lu)", child.c_str(), dw);
+            DWORD e = GetLastError();
+            FindClose(hFind);
+            if (e != ERROR_NO_MORE_FILES) {
+                return e;
             }
-        } while (FindNextFileW(hFind, &fd));
-
-        DWORD e = GetLastError();
-        FindClose(hFind);
-        if (e != ERROR_NO_MORE_FILES) {
-            return e;
-        }
-    } else {
-        DWORD e = GetLastError();
-        if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
-            return e;
+            
+            dirsToDelete.push_back(currentPath);
+            for (auto& item : subItems) {
+                dirsToDelete.push_back(std::move(item));
+            }
+        } else {
+            DWORD e = GetLastError();
+            if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+                return e;
+            }
+            ClearReadOnlyAttributeIfSet(currentPath);
+            if (!RemoveDirectoryW(currentPath.c_str())) {
+                e = GetLastError();
+                if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+                    return e;
+                }
+            }
         }
     }
 
-    ClearReadOnlyAttributeIfSet(path);
-    if (RemoveDirectoryW(path.c_str())) return ERROR_SUCCESS;
-
-    DWORD e = GetLastError();
-    if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return ERROR_SUCCESS;
-    return e;
+    return ERROR_SUCCESS;
 }
 
 static void DeleteSubdirectoriesOfRoot(const std::wstring& root) {
@@ -684,8 +766,8 @@ static void DeleteSubdirectoriesOfRoot(const std::wstring& root) {
 }
 
 static void CleanupAllowedPathSubdirs() {
-    for (const auto& p : AllowedPaths) {
-        DeleteSubdirectoriesOfRoot(p);
+    for (const auto& entry : AllowedPaths) {
+        DeleteSubdirectoriesOfRoot(entry.path);
     }
 }
 
@@ -1189,14 +1271,54 @@ static bool ParseCapabilityList(WCHAR* caps) {
     return true;
 }
 
+static PathAccessLevel ParseAccessLevel(const std::wstring& pathWithLevel, std::wstring& outPath) {
+    outPath = pathWithLevel;
+    
+    size_t colonPos = pathWithLevel.rfind(L':');
+    if (colonPos != std::wstring::npos && colonPos > 1 && colonPos + 1 < pathWithLevel.size()) {
+        std::wstring levelStr = pathWithLevel.substr(colonPos + 1);
+        outPath = TrimCopy(pathWithLevel.substr(0, colonPos));
+        
+        if (levelStr == L"R" || levelStr == L"r") {
+            return PathAccessLevel::ReadOnly;
+        } else if (levelStr == L"RX" || levelStr == L"rx") {
+            return PathAccessLevel::ReadExecute;
+        } else if (levelStr == L"RW" || levelStr == L"rw") {
+            return PathAccessLevel::ReadWrite;
+        } else if (levelStr == L"F" || levelStr == L"f") {
+            return PathAccessLevel::FullControl;
+        }
+    }
+    
+    return PathAccessLevel::FullControl;
+}
+
 static bool ParseAllowedPathList(WCHAR* paths) {
     if (!paths) return true;
 
+    // Remove surrounding quotes if present
+    std::wstring pathsStr = TrimCopy(paths);
+    if (pathsStr.size() >= 2 && pathsStr.front() == L'"' && pathsStr.back() == L'"') {
+        pathsStr = pathsStr.substr(1, pathsStr.size() - 2);
+    }
+    // Copy to mutable buffer
+    std::vector<wchar_t> buf(pathsStr.begin(), pathsStr.end());
+    buf.push_back(L'\0');
+
     WCHAR* ctx = nullptr;
-    for (WCHAR* tok = wcstok_s(paths, L";", &ctx); tok != nullptr; tok = wcstok_s(nullptr, L";", &ctx)) {
-        std::wstring p = TrimCopy(tok);
-        if (!p.empty()) {
-            if (AddAllowedPathUnique(p)) {}
+    // Support both semicolon and comma as separators
+    for (WCHAR* tok = wcstok_s(buf.data(), L";,", &ctx); tok != nullptr; tok = wcstok_s(nullptr, L";,", &ctx)) {
+        std::wstring raw = TrimCopy(tok);
+        // Remove quotes around each path
+        if (raw.size() >= 2 && raw.front() == L'"' && raw.back() == L'"') {
+            raw = raw.substr(1, raw.size() - 2);
+        }
+        if (!raw.empty()) {
+            std::wstring path;
+            PathAccessLevel level = ParseAccessLevel(raw, path);
+            if (!path.empty()) {
+                AddAllowedPathUnique(path, level);
+            }
         }
     }
     return true;
@@ -1306,6 +1428,8 @@ static bool ParseArguments(int argc, WCHAR** argv) {
         case L'r': RetainProfile = true; break;
         case L'l': LaunchAsLpac = true; break;
         case L'k': NoWin32k = true; break;
+        case L'C': AllowChildProcess = true; break;
+        case L'R': UseRestrictedToken = true; break;
         case L'x': CleanupAllowedSubdirs = true; break;
         case L'g': g_LogEnabled = true; break;
         default:
@@ -1368,7 +1492,7 @@ static DWORD DeleteAppContainerProfileWithMoniker() {
 // ========================================================================
 // Security / ACL Management
 // ========================================================================
-static DWORD GrantFullControlToSidOnPath(PCWSTR path, PSID sid) {
+static DWORD GrantAccessToSidOnPath(PCWSTR path, PSID sid, PathAccessLevel level) {
     PSECURITY_DESCRIPTOR sd = nullptr;
     PACL oldDacl = nullptr;
 
@@ -1380,7 +1504,21 @@ static DWORD GrantFullControlToSidOnPath(PCWSTR path, PSID sid) {
     }
 
     EXPLICIT_ACCESSW ea{};
-    ea.grfAccessPermissions = FILE_ALL_ACCESS;
+    switch (level) {
+        case PathAccessLevel::ReadOnly:
+            ea.grfAccessPermissions = GENERIC_READ | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE;
+            break;
+        case PathAccessLevel::ReadExecute:
+            ea.grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE;
+            break;
+        case PathAccessLevel::ReadWrite:
+            ea.grfAccessPermissions = GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE;
+            break;
+        case PathAccessLevel::FullControl:
+        default:
+            ea.grfAccessPermissions = FILE_ALL_ACCESS;
+            break;
+    }
     ea.grfAccessMode = GRANT_ACCESS;
     ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
     BuildTrusteeWithSidW(&ea.Trustee, sid);
@@ -1404,10 +1542,16 @@ static DWORD GrantFullControlToSidOnPath(PCWSTR path, PSID sid) {
     return dw;
 }
 
+static DWORD GrantFullControlToSidOnPath(PCWSTR path, PSID sid) {
+    return GrantAccessToSidOnPath(path, sid, PathAccessLevel::FullControl);
+}
+
 static DWORD SetLowIntegrityLabel(PCWSTR path) {
     PSECURITY_DESCRIPTOR sd = nullptr;
+    // S:(ML;;NW;;;LW) - Low integrity label with inheritance (OI)(CI)
+    // OI = OBJECT_INHERIT_ACE, CI = CONTAINER_INHERIT_ACE
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr)) {
+            L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr)) {
         DWORD err = GetLastError();
         LogError(L"[ACL] ConvertStringSecurityDescriptorToSecurityDescriptorW failed: err=%lu", err);
         return err;
@@ -1465,7 +1609,7 @@ static DWORD SaveOriginalSecurityForPath(PCWSTR path) {
         LogWarn(L"[Security] Failed to backup Label SACL for %ls (err=%lu)", path, saclErr);
     }
 
-    g_SavedSecurity.emplace_back(ss);
+    g_SavedSecurity.push_back(std::move(ss));
     return (daclErr == ERROR_SUCCESS || saclErr == ERROR_SUCCESS) ? ERROR_SUCCESS
            : (daclErr != ERROR_SUCCESS ? daclErr : saclErr);
 }
@@ -1493,8 +1637,6 @@ static void RestoreSavedSecurity() {
                 ++failedSacl;
             }
         }
-        if (ss.sdDacl) { LocalFree(ss.sdDacl); ss.sdDacl = nullptr; }
-        if (ss.sdSacl) { LocalFree(ss.sdSacl); ss.sdSacl = nullptr; }
     }
     g_SavedSecurity.clear();
 
@@ -1514,49 +1656,69 @@ static void RestoreSavedSecurityOnce() {
 static void GrantAccessToAllowedPaths(PSID appContainerSid) {
     int grantedCount = 0, skippedCount = 0, failedCount = 0;
 
-    for (const auto& path : AllowedPaths) {
-        DWORD attrs = GetFileAttributesW(path.c_str());
+    for (const auto& entry : AllowedPaths) {
+        DWORD attrs = GetFileAttributesW(entry.path.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES) {
-            wprintf(L"[Skip] Path not found: %ls (err=%lu)\r\n", path.c_str(), GetLastError());
-            LogWarn(L"[Permissions] Skip path (not found): %ls (err=%lu)", path.c_str(), GetLastError());
+            wprintf(L"[Skip] Path not found: %ls (err=%lu)\r\n", entry.path.c_str(), GetLastError());
+            LogWarn(L"[Permissions] Skip path (not found): %ls (err=%lu)", entry.path.c_str(), GetLastError());
             ++skippedCount;
             continue;
         }
         if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-            wprintf(L"[Skip] Not a directory: %ls (attrs=0x%08lX)\r\n", path.c_str(), attrs);
-            LogWarn(L"[Permissions] Skip path (not directory): %ls (attrs=0x%08lX)", path.c_str(), attrs);
+            wprintf(L"[Skip] Not a directory: %ls (attrs=0x%08lX)\r\n", entry.path.c_str(), attrs);
+            LogWarn(L"[Permissions] Skip path (not directory): %ls (attrs=0x%08lX)", entry.path.c_str(), attrs);
             ++skippedCount;
             continue;
         }
 
-        SaveOriginalSecurityForPath(path.c_str());
+        SaveOriginalSecurityForPath(entry.path.c_str());
         SavedSecurity* backup = g_SavedSecurity.empty() ? nullptr : &g_SavedSecurity.back();
         bool modifiedThisPath = false;
 
         if (backup && backup->hasDacl) {
-            DWORD dw = GrantFullControlToSidOnPath(path.c_str(), appContainerSid);
+            DWORD dw = GrantAccessToSidOnPath(entry.path.c_str(), appContainerSid, entry.accessLevel);
             if (dw == ERROR_SUCCESS) {
-                wprintf(L"[OK] Granted (F) to %ls\r\n", path.c_str());
+                const wchar_t* levelStr = L"R";
+                if (entry.accessLevel == PathAccessLevel::ReadExecute) levelStr = L"RX";
+                else if (entry.accessLevel == PathAccessLevel::ReadWrite) levelStr = L"RW";
+                else if (entry.accessLevel == PathAccessLevel::FullControl) levelStr = L"F";
+                wprintf(L"[OK] Granted (%ls) to %ls\r\n", levelStr, entry.path.c_str());
                 modifiedThisPath = true;
             } else {
-                wprintf(L"[Warn] Grant (F) failed on %ls (%lu)\r\n", path.c_str(), dw);
-                LogWarn(L"[Permissions] Grant (F) failed on %ls (err=%lu)", path.c_str(), dw);
+                wprintf(L"[Warn] Grant failed on %ls (%lu)\r\n", entry.path.c_str(), dw);
+                LogWarn(L"[Permissions] Grant failed on %ls (err=%lu)", entry.path.c_str(), dw);
                 ++failedCount;
             }
         }
 
         if (PathLowIntegrity && backup && backup->hasSacl) {
-            DWORD dw = SetLowIntegrityLabel(path.c_str());
+            DWORD dw = SetLowIntegrityLabel(entry.path.c_str());
             if (dw == ERROR_SUCCESS) {
-                wprintf(L"[OK] Low Integrity set on %ls\r\n", path.c_str());
+                wprintf(L"[OK] Low Integrity set on %ls\r\n", entry.path.c_str());
                 modifiedThisPath = true;
             } else {
-                wprintf(L"[Warn] Set Low Integrity failed on %ls (%lu)\r\n", path.c_str(), dw);
+                wprintf(L"[Warn] Set Low Integrity failed on %ls (%lu)\r\n", entry.path.c_str(), dw);
                 if (dw == ERROR_ACCESS_DENIED)
-                    LogWarn(L"[Permissions] Set Low Integrity DENIED on %ls. Run elevated or set lowIntegrityOnPaths=false.", path.c_str());
+                    LogWarn(L"[Permissions] Set Low Integrity DENIED on %ls. Run elevated or set lowIntegrityOnPaths=false.", entry.path.c_str());
                 else
-                    LogWarn(L"[Permissions] Set Low Integrity failed on %ls (err=%lu)", path.c_str(), dw);
+                    LogWarn(L"[Permissions] Set Low Integrity failed on %ls (err=%lu)", entry.path.c_str(), dw);
                 ++failedCount;
+            }
+            
+            // 为低完整性进程添加明确的写入权限
+            if (entry.accessLevel == PathAccessLevel::ReadWrite || entry.accessLevel == PathAccessLevel::FullControl) {
+                PSID pLowIntegritySid = nullptr;
+                if (ConvertStringSidToSid(L"S-1-16-4096", &pLowIntegritySid)) {
+                    DWORD dwLow = GrantAccessToSidOnPath(entry.path.c_str(), pLowIntegritySid, entry.accessLevel);
+                    if (dwLow == ERROR_SUCCESS) {
+                        wprintf(L"[OK] Granted Low-IL write access on %ls\r\n", entry.path.c_str());
+                        LogInfo(L"[Permissions] Low-IL write access granted on %ls", entry.path.c_str());
+                    } else {
+                        wprintf(L"[Warn] Failed to grant Low-IL write access on %ls (%lu)\r\n", entry.path.c_str(), dwLow);
+                        LogWarn(L"[Permissions] Failed to grant Low-IL write access on %ls (err=%lu)", entry.path.c_str(), dwLow);
+                    }
+                    LocalFree(pLowIntegritySid);
+                }
             }
         }
 
@@ -1715,10 +1877,10 @@ static std::wstring FindDllNameInBinary(const BYTE* data, size_t dataSize) {
 // Convert an RVA (Relative Virtual Address) to a file offset using the section table.
 // Returns 0 on failure. The PE base pointer must point to a valid MZ header.
 static DWORD RvaToFileOffset(const BYTE* peBase, size_t peSize, DWORD rva) {
-    if (peSize < 0x200 || rva == 0) return 0;
+    if (peSize < 0x40 || rva == 0) return 0;
 
     DWORD peOff = *reinterpret_cast<const DWORD*>(peBase + 0x3C);
-    if (peOff + 4 + 20 > peSize) return 0;
+    if (peOff < 0x40 || peOff + 4 + 20 > peSize) return 0;
 
     size_t coffOff = peOff + 4;
     WORD numSections = *reinterpret_cast<const WORD*>(peBase + coffOff + 2);
@@ -2377,8 +2539,8 @@ static std::wstring ResolveExeFullPath(PCWSTR exeName) {
         }
     }
 
-    for (const auto& p : AllowedPaths) {
-        std::wstring c = JoinPath(p, image);
+    for (const auto& entry : AllowedPaths) {
+        std::wstring c = JoinPath(entry.path, image);
         DWORD a = GetFileAttributesW(c.c_str());
         if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
             return c;
@@ -2437,7 +2599,7 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
         }
     }
 
-    std::wstring stagingBase = AllowedPaths.empty() ? GetExeDir() : AllowedPaths[0];
+    std::wstring stagingBase = AllowedPaths.empty() ? GetExeDir() : AllowedPaths[0].path;
     if (stagingBase.empty()) {
         LogWarn(L"[BunVFS] No suitable base directory for staging.");
         return false;
@@ -2589,12 +2751,12 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
         }
 
         // Candidate 3: AllowedPaths[0] (staging base, if different from above)
-        if (!AllowedPaths.empty() && !AllowedPaths[0].empty()) {
+        if (!AllowedPaths.empty() && !AllowedPaths[0].path.empty()) {
             bool dup = false;
             for (int i = 0; i < numCandidates; ++i) {
-                if (IEquals(AllowedPaths[0], candidateBases[i])) { dup = true; break; }
+                if (IEquals(AllowedPaths[0].path, candidateBases[i])) { dup = true; break; }
             }
-            if (!dup) candidateBases[numCandidates++] = AllowedPaths[0];
+            if (!dup) candidateBases[numCandidates++] = AllowedPaths[0].path;
         }
 
         for (int i = 0; i < numCandidates; ++i) {
@@ -2778,6 +2940,121 @@ static bool BuildChildEnvBlockFromOverrides() {
 }
 
 // ========================================================================
+// Process Launcher (Restricted Token mode - allows child processes)
+// ========================================================================
+static DWORD LaunchProcessWithRestrictedToken() {
+    DWORD result = ERROR_SUCCESS;
+    
+    LogInfo(L"[Launch] Starting with Restricted Token: %ls (wait=%ls, newConsole=%ls)",
+            ExeToLaunch, WaitForExit ? L"yes" : L"no", UseNewConsole ? L"yes" : L"no");
+    
+    SAFER_LEVEL_HANDLE hLevel = NULL;
+    HANDLE hRestrictedToken = NULL;
+    
+    do {
+        if (!SaferCreateLevel(SAFER_SCOPEID_USER, SAFER_LEVELID_NORMALUSER, SAFER_LEVEL_OPEN, &hLevel, NULL)) {
+            result = GetLastError();
+            LogError(L"[Launch] SaferCreateLevel failed: err=%lu", result);
+            break;
+        }
+        
+        if (!SaferComputeTokenFromLevel(hLevel, NULL, &hRestrictedToken, 0, NULL)) {
+            result = GetLastError();
+            LogError(L"[Launch] SaferComputeTokenFromLevel failed: err=%lu", result);
+            SaferCloseLevel(hLevel);
+            break;
+        }
+        SaferCloseLevel(hLevel);
+        hLevel = NULL;
+        
+        TOKEN_MANDATORY_LABEL tml = { 0 };
+        tml.Label.Attributes = SE_GROUP_INTEGRITY;
+        
+        const wchar_t* integritySid = L"S-1-16-4096";  // Low
+        const wchar_t* integrityName = L"Low";
+        if (IntegrityLevel == 1) {
+            integritySid = L"S-1-16-8192";  // Medium
+            integrityName = L"Medium";
+        } else if (IntegrityLevel == 2) {
+            integritySid = L"S-1-16-12288";  // High
+            integrityName = L"High";
+        }
+        
+        if (!ConvertStringSidToSid((LPWSTR)integritySid, &tml.Label.Sid)) {
+            result = GetLastError();
+            LogError(L"[Launch] ConvertStringSidToSid failed: err=%lu", result);
+            CloseHandle(hRestrictedToken);
+            break;
+        }
+        
+        DWORD tmlSize = sizeof(tml) + GetLengthSid(tml.Label.Sid);
+        if (!SetTokenInformation(hRestrictedToken, TokenIntegrityLevel, &tml, tmlSize)) {
+            result = GetLastError();
+            LogError(L"[Launch] SetTokenInformation(TokenIntegrityLevel) failed: err=%lu", result);
+            LocalFree(tml.Label.Sid);
+            CloseHandle(hRestrictedToken);
+            break;
+        }
+        LocalFree(tml.Label.Sid);
+        
+        LogInfo(L"[Launch] Restricted token created with %ls integrity level", integrityName);
+        
+        STARTUPINFOEXW si = { 0 };
+        PROCESS_INFORMATION pi = { 0 };
+        si.StartupInfo.cb = sizeof(si);
+        
+        DWORD createFlags = 0;
+        LPVOID envBlock = nullptr;
+        if (!g_ChildEnv.empty()) {
+            envBlock = g_ChildEnv.data();
+            createFlags |= CREATE_UNICODE_ENVIRONMENT;
+        }
+        if (UseNewConsole) {
+            createFlags |= CREATE_NEW_CONSOLE;
+        }
+        
+        if (!CreateProcessAsUserW(hRestrictedToken, NULL, ExeToLaunch, NULL, NULL, FALSE,
+                                  createFlags, envBlock, NULL, &si.StartupInfo, &pi)) {
+            result = GetLastError();
+            LogError(L"[Launch] CreateProcessAsUserW FAILED: err=%lu", result);
+            if (result == ERROR_ACCESS_DENIED)
+                LogError(L"[Launch] Hint: ACCESS_DENIED - check if the exe is accessible.");
+            else if (result == ERROR_FILE_NOT_FOUND)
+                LogError(L"[Launch] Hint: FILE_NOT_FOUND - verify the exe path is correct.");
+            CloseHandle(hRestrictedToken);
+            break;
+        }
+        
+        CloseHandle(hRestrictedToken);
+        
+        LogInfo(L"[Launch] Process created: PID=%lu, TID=%lu", pi.dwProcessId, pi.dwThreadId);
+        
+        if (WaitForExit) {
+            DWORD waitResult = WaitForSingleObject(pi.hProcess, INFINITE);
+            if (waitResult == WAIT_OBJECT_0) {
+                DWORD exitCode = 0;
+                if (GetExitCodeProcess(pi.hProcess, &exitCode)) {
+                    LogInfo(L"[Launch] Child exited: code=%lu (0x%08lX)", exitCode, exitCode);
+                    result = exitCode;
+                } else {
+                    result = GetLastError();
+                    LogError(L"[Launch] GetExitCodeProcess failed: err=%lu", result);
+                }
+            } else {
+                result = GetLastError();
+                LogError(L"[Launch] WaitForSingleObject failed: err=%lu", result);
+            }
+        }
+        
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        
+    } while (false);
+    
+    return result;
+}
+
+// ========================================================================
 // Process Launcher (AppContainer mode)
 // ========================================================================
 static DWORD LaunchProcess(PSID packageSid) {
@@ -2869,6 +3146,7 @@ static DWORD LaunchProcess(PSID packageSid) {
     if (LaunchAsLpac) ++attributeCount;
     if (NoWin32k) ++attributeCount;
     if (useConPty) ++attributeCount;
+    if (AllowChildProcess) ++attributeCount;
 
     SIZE_T attrListSize = 0;
     InitializeProcThreadAttributeList(nullptr, attributeCount, 0, &attrListSize);
@@ -2917,6 +3195,16 @@ static DWORD LaunchProcess(PSID packageSid) {
                 break;
             }
         }
+        if (AllowChildProcess) {
+            DWORD childProcessPolicy = PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
+            if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+                                           &childProcessPolicy, sizeof(childProcessPolicy), nullptr, nullptr)) {
+                result = GetLastError();
+                LogError(L"[Launch] UpdateProcThreadAttribute(CHILD_PROCESS_POLICY) failed: err=%lu", result);
+                break;
+            }
+            LogInfo(L"[Launch] Child process policy set to OVERRIDE (allow child process creation)");
+        }
         if (useConPty && hPC) {
             if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                                            hPC, sizeof(hPC), nullptr, nullptr)) {
@@ -2945,6 +3233,11 @@ static DWORD LaunchProcess(PSID packageSid) {
                 LogError(L"[Launch] Hint: FILE_NOT_FOUND - verify the exe path is correct.");
             else if (result == ERROR_ELEVATION_REQUIRED)
                 LogError(L"[Launch] Hint: ELEVATION_REQUIRED - the target exe requires admin privileges.");
+            
+            // Clean up ConPTY resources on failure
+            if (hPC) { g_pfnClosePC(hPC); hPC = nullptr; }
+            if (hPipeIn_W) { CloseHandle(hPipeIn_W); hPipeIn_W = nullptr; }
+            if (hPipeOut_R) { CloseHandle(hPipeOut_R); hPipeOut_R = nullptr; }
             break;
         }
 
@@ -3134,7 +3427,9 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
     auto caps = ReadIniString(ini, L"capabilities");
     if (!caps.empty()) { ParseCapabilityListFromArg(caps.c_str()); }
     auto allowPaths = ReadIniString(ini, L"allowPaths");
+    LogInfo(L"[Config] allowPaths raw: '%ls'", allowPaths.c_str());
     if (!allowPaths.empty()) { ParseAllowedPathListFromArg(allowPaths.c_str()); }
+    LogInfo(L"[Config] AllowedPaths count: %llu", (unsigned long long)AllowedPaths.size());
     auto env = ReadIniString(ini, L"env");
     if (!env.empty()) { ParseEnvListFromArg(env.c_str()); }
     auto prepend = ReadIniString(ini, L"pathPrepend");
@@ -3148,6 +3443,19 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
     RetainProfile = IniBoolFromString(ReadIniString(ini, L"retainProfile"), RetainProfile);
     LaunchAsLpac = IniBoolFromString(ReadIniString(ini, L"lpac"), LaunchAsLpac);
     NoWin32k = IniBoolFromString(ReadIniString(ini, L"noWin32k"), NoWin32k);
+    AllowChildProcess = IniBoolFromString(ReadIniString(ini, L"allowChildProcess"), AllowChildProcess);
+    LogInfo(L"[Config] allowChildProcess=%s", AllowChildProcess ? L"true" : L"false");
+    UseRestrictedToken = IniBoolFromString(ReadIniString(ini, L"restrictedToken"), UseRestrictedToken);
+    LogInfo(L"[Config] restrictedToken=%s", UseRestrictedToken ? L"true" : L"false");
+    
+    auto integrityStr = ReadIniString(ini, L"integrityLevel");
+    if (!integrityStr.empty()) {
+        if (integrityStr == L"low" || integrityStr == L"0") IntegrityLevel = 0;
+        else if (integrityStr == L"medium" || integrityStr == L"1") IntegrityLevel = 1;
+        else if (integrityStr == L"high" || integrityStr == L"2") IntegrityLevel = 2;
+    }
+    LogInfo(L"[Config] integrityLevel=%d (0=Low, 1=Medium, 2=High)", IntegrityLevel);
+    
     UseNewConsole = IniBoolFromString(ReadIniString(ini, L"newConsole"), UseNewConsole);
     UseConPty = IniBoolFromString(ReadIniString(ini, L"conpty"), UseConPty);
     HideParentConsole = IniBoolFromString(ReadIniString(ini, L"hideParentConsole"), HideParentConsole);
@@ -3312,6 +3620,47 @@ int wmain(int argc, WCHAR** argv) {
     }
 
     // ================================================================
+    // Restricted Token Sandbox (allows child processes)
+    // ================================================================
+    if (UseRestrictedToken) {
+        LogInfo(L"[Phase] Using Restricted Token mode (allows child processes)");
+        
+        HANDLE hToken = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            DWORD tokenUserLen = 0;
+            GetTokenInformation(hToken, TokenUser, nullptr, 0, &tokenUserLen);
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && tokenUserLen > 0) {
+                PTOKEN_USER pTokenUser = (PTOKEN_USER)LocalAlloc(LPTR, tokenUserLen);
+                if (pTokenUser && GetTokenInformation(hToken, TokenUser, pTokenUser, tokenUserLen, &tokenUserLen)) {
+                    PSID userSid = pTokenUser->User.Sid;
+                    if (!AllowedPaths.empty()) {
+                        GrantAccessToAllowedPaths(userSid);
+                    }
+                }
+                if (pTokenUser) LocalFree(pTokenUser);
+            }
+            CloseHandle(hToken);
+        }
+        
+        PrepareBunVirtualDrive(nullptr);
+        atexit(AtExitCleanupBunDrive);
+        SetUnhandledExceptionFilter(BunDriveCrashHandler);
+        
+        if (!EnvOverrides.empty() || !PathPrependEntries.empty()) {
+            BuildChildEnvBlockFromOverrides();
+        }
+        
+        LogInfo(L"[Phase] Launching child process...");
+        result = LaunchProcessWithRestrictedToken();
+        
+        if (CleanupAllowedSubdirs && (WaitForExit || result != ERROR_SUCCESS)) {
+            CleanupAllowedPathSubdirs();
+        }
+        
+        goto Cleanup;
+    }
+
+    // ================================================================
     // AppContainer Sandbox
     // ================================================================
     LogInfo(L"[Phase] Creating AppContainer profile...");
@@ -3343,21 +3692,12 @@ int wmain(int argc, WCHAR** argv) {
         CleanupAllowedPathSubdirs();
     }
 
-    if (InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
-        if (WaitForExit || result != ERROR_SUCCESS) {
-            RestoreSavedSecurityOnce();
-        }
-    }
-
 Cleanup:
     ShutdownNetworkFilter();
 
-    // Remove B: drive mapping
     CleanupBunVirtualDrive();
 
-    if (result != ERROR_SUCCESS && InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
-        RestoreSavedSecurityOnce();
-    }
+    RestoreSavedSecurityOnce();
     if (WaitForExit && !RetainProfile && g_ProfileWasCreated) {
         DeleteAppContainerProfileWithMoniker();
     }

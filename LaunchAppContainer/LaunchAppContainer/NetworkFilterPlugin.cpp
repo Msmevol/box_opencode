@@ -104,6 +104,16 @@ void NetworkFilterPlugin::Shutdown() {
         g_State.serverThread = nullptr;
     }
     
+    int waitCount = 0;
+    while (g_State.activeConnections > 0 && waitCount < 30) {
+        Sleep(100);
+        waitCount++;
+    }
+    if (g_State.activeConnections > 0) {
+        LogWarn(L"[NetworkFilterPlugin] %d active connections still pending after shutdown timeout", 
+                 g_State.activeConnections.load());
+    }
+    
     WSACleanup();
     
     LogInfo(L"[NetworkFilterPlugin] Shutdown complete.");
@@ -111,6 +121,8 @@ void NetworkFilterPlugin::Shutdown() {
 }
 
 void NetworkFilterPlugin::SetAllowedDomains(const std::vector<std::wstring>& domains) {
+    std::lock_guard<std::mutex> lock(g_State.mutex);
+    
     g_State.allowedDomains.clear();
     
     for (const auto& domain : domains) {
@@ -150,6 +162,10 @@ std::wstring NetworkFilterPlugin::GetProxyUrl() {
 bool NetworkFilterPlugin::MatchDomainPattern(const std::wstring& pattern, const std::wstring& domain) {
     if (pattern.empty() || domain.empty()) {
         return false;
+    }
+    
+    if (pattern == L"*") {
+        return true;
     }
     
     size_t wildcardPos = pattern.find(L'*');
@@ -224,9 +240,12 @@ std::string NetworkFilterPlugin::ExtractDomainFromUrl(const std::string& url) {
     
     size_t start = 0;
     
-    if (url.find("://") != std::string::npos) {
-        start = url.find("://") + 3;
+    size_t protoPos = url.find("://");
+    if (protoPos != std::string::npos) {
+        start = protoPos + 3;
     }
+    
+    if (start >= url.size()) return "";
     
     size_t end = url.find('/', start);
     if (end == std::string::npos) {
@@ -236,6 +255,8 @@ std::string NetworkFilterPlugin::ExtractDomainFromUrl(const std::string& url) {
         end = url.size();
     }
     
+    if (end <= start) return "";
+    
     return url.substr(start, end - start);
 }
 
@@ -243,6 +264,9 @@ std::string NetworkFilterPlugin::ReadLine(void* sock) {
     SOCKET s = (SOCKET)sock;
     std::string result;
     char ch;
+    
+    DWORD timeout = 30000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     
     while (true) {
         int recvResult = recv(s, &ch, 1, 0);
@@ -328,10 +352,17 @@ bool NetworkFilterPlugin::ConnectToServer(const std::string& host, int port, voi
 }
 
 bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
+    g_State.activeConnections++;
     SOCKET client = (SOCKET)clientSocket;
+    
+    auto cleanup = [&]() {
+        closesocket(client);
+        g_State.activeConnections--;
+    };
+    
     std::string requestLine = ReadLine(clientSocket);
     if (requestLine.empty()) {
-        closesocket(client);
+        cleanup();
         return false;
     }
     
@@ -339,7 +370,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     if (!ParseRequestLine(requestLine, method, url, version)) {
         LogProxyError(L"Invalid request line from client");
         SendErrorResponse(clientSocket, 400, "Bad Request", "Invalid request line");
-        closesocket(client);
+        cleanup();
         return false;
     }
     
@@ -347,7 +378,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     if (domain.empty()) {
         LogProxyError(L"Could not extract domain from URL");
         SendErrorResponse(clientSocket, 400, "Bad Request", "Invalid URL");
-        closesocket(client);
+        cleanup();
         return false;
     }
     
@@ -355,11 +386,14 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     
     bool allowed = false;
     std::wstring matchedPatternStr;
-    for (const auto& pattern : g_State.allowedDomains) {
-        if (MatchDomainPattern(pattern.pattern, domainW)) {
-            matchedPatternStr = pattern.pattern;
-            allowed = true;
-            break;
+    {
+        std::lock_guard<std::mutex> lock(g_State.mutex);
+        for (const auto& pattern : g_State.allowedDomains) {
+            if (MatchDomainPattern(pattern.pattern, domainW)) {
+                matchedPatternStr = pattern.pattern;
+                allowed = true;
+                break;
+            }
         }
     }
     
@@ -370,7 +404,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
         LogProxyBlock(methodW.c_str(), domainW.c_str(), L"no matching rule");
         SendErrorResponse(clientSocket, 403, "Forbidden", 
                        "Access to this domain is not allowed by network filter");
-        closesocket(client);
+        cleanup();
         return false;
     }
     
@@ -379,7 +413,16 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     std::string host = domain;
     if (portPos != std::string::npos) {
         host = domain.substr(0, portPos);
-        port = std::stoi(domain.substr(portPos + 1));
+        try {
+            int parsedPort = std::stoi(domain.substr(portPos + 1));
+            if (parsedPort > 0 && parsedPort <= 65535) {
+                port = parsedPort;
+            } else {
+                LogProxyWarn(L"Invalid port number %d in URL, using default 443", parsedPort);
+            }
+        } catch (const std::exception& e) {
+            LogProxyWarn(L"Failed to parse port from URL, using default 443: %hs", e.what());
+        }
     }
     
     if (_stricmp(method.c_str(), "CONNECT") == 0) {
@@ -388,7 +431,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
             LogProxyError(L"CONNECT tunnel failed: cannot reach %hs:%d", host.c_str(), port);
             SendErrorResponse(clientSocket, 502, "Bad Gateway", 
                            "Failed to connect to target server");
-            closesocket(client);
+            cleanup();
             return false;
         }
         
@@ -404,7 +447,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
             LogProxyError(L"HTTP forward failed: cannot reach %hs:%d", host.c_str(), port);
             SendErrorResponse(clientSocket, 502, "Bad Gateway", 
                            "Failed to connect to target server");
-            closesocket(client);
+            cleanup();
             return false;
         }
         
@@ -423,7 +466,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
         closesocket(server);
     }
     
-    closesocket(client);
+    cleanup();
     return true;
 }
 
@@ -432,29 +475,47 @@ bool NetworkFilterPlugin::HandleHttpsTunnel(void* client, void* server) {
     SOCKET s = (SOCKET)server;
     char buffer[4096];
     
-    while (true) {
+    while (g_State.running) {
         fd_set readSet;
         FD_ZERO(&readSet);
         FD_SET(c, &readSet);
         FD_SET(s, &readSet);
         
         SOCKET maxFd = (c > s) ? c : s;
-        int selectResult = select((int)maxFd + 1, &readSet, nullptr, nullptr, nullptr);
+        timeval timeout;
+        timeout.tv_sec = 300;
+        timeout.tv_usec = 0;
+        int selectResult = select((int)maxFd + 1, &readSet, nullptr, nullptr, &timeout);
         
-        if (selectResult <= 0) {
+        if (selectResult == 0) {
+            LogProxyWarn(L"HTTPS tunnel timeout after 300 seconds of inactivity");
+            break;
+        }
+        
+        if (selectResult < 0) {
+            int err = WSAGetLastError();
+            LogProxyWarn(L"HTTPS tunnel select() error: %d", err);
             break;
         }
         
         if (FD_ISSET(c, &readSet)) {
             int recvLen = recv(c, buffer, sizeof(buffer), 0);
             if (recvLen <= 0) break;
-            send(s, buffer, recvLen, 0);
+            int sendResult = send(s, buffer, recvLen, 0);
+            if (sendResult <= 0) {
+                LogProxyWarn(L"HTTPS tunnel send() to server failed: %d", WSAGetLastError());
+                break;
+            }
         }
         
         if (FD_ISSET(s, &readSet)) {
             int recvLen = recv(s, buffer, sizeof(buffer), 0);
             if (recvLen <= 0) break;
-            send(c, buffer, recvLen, 0);
+            int sendResult = send(c, buffer, recvLen, 0);
+            if (sendResult <= 0) {
+                LogProxyWarn(L"HTTPS tunnel send() to client failed: %d", WSAGetLastError());
+                break;
+            }
         }
     }
     
@@ -466,9 +527,12 @@ bool NetworkFilterPlugin::ForwardData(void* src, void* dst) {
     SOCKET d = (SOCKET)dst;
     char buffer[8192];
     
-    while (true) {
+    while (g_State.running) {
         int recvLen = recv(s, buffer, sizeof(buffer), 0);
         if (recvLen <= 0) {
+            if (recvLen < 0) {
+                LogProxyWarn(L"ForwardData recv() failed: %d", WSAGetLastError());
+            }
             break;
         }
         
@@ -476,6 +540,7 @@ bool NetworkFilterPlugin::ForwardData(void* src, void* dst) {
         while (sent < recvLen) {
             int sendResult = send(d, buffer + sent, recvLen - sent, 0);
             if (sendResult <= 0) {
+                LogProxyWarn(L"ForwardData send() failed: %d", WSAGetLastError());
                 break;
             }
             sent += sendResult;
