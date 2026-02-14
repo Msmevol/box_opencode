@@ -3,10 +3,18 @@
 #include <string>
 #include <vector>
 
+// Sandbox log functions (writes to main sandbox log)
 extern void LogInfo(const wchar_t* fmt, ...);
 extern void LogWarn(const wchar_t* fmt, ...);
 extern void LogError(const wchar_t* fmt, ...);
 extern void LogDebug(const wchar_t* fmt, ...);
+
+// Proxy log functions (writes to separate proxy log file)
+extern void LogProxyAllow(const wchar_t* method, const wchar_t* domain, const wchar_t* matchedPattern);
+extern void LogProxyBlock(const wchar_t* method, const wchar_t* domain, const wchar_t* reason);
+extern void LogProxyInfo(const wchar_t* fmt, ...);
+extern void LogProxyWarn(const wchar_t* fmt, ...);
+extern void LogProxyError(const wchar_t* fmt, ...);
 
 struct DomainPattern {
     std::wstring pattern;

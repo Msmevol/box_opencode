@@ -80,6 +80,7 @@ bool NetworkFilterPlugin::Initialize(int port) {
     
     g_State.running = true;
     LogInfo(L"[NetworkFilterPlugin] Initialized and listening on 127.0.0.1:%d", g_State.port);
+    LogProxyInfo(L"========== Proxy started on 127.0.0.1:%d ==========", g_State.port);
     return true;
 }
 
@@ -106,6 +107,7 @@ void NetworkFilterPlugin::Shutdown() {
     WSACleanup();
     
     LogInfo(L"[NetworkFilterPlugin] Shutdown complete.");
+    LogProxyInfo(L"========== Proxy stopped ==========");
 }
 
 void NetworkFilterPlugin::SetAllowedDomains(const std::vector<std::wstring>& domains) {
@@ -123,6 +125,14 @@ void NetworkFilterPlugin::SetAllowedDomains(const std::vector<std::wstring>& dom
     
     LogInfo(L"[NetworkFilterPlugin] Total %llu allowed domains configured.", 
              (unsigned long long)g_State.allowedDomains.size());
+    
+    // Log domain rules to proxy log for visibility
+    LogProxyInfo(L"--- Allowed domain rules (%llu) ---",
+                 (unsigned long long)g_State.allowedDomains.size());
+    for (const auto& dp : g_State.allowedDomains) {
+        LogProxyInfo(L"  %ls %ls", dp.hasWildcard ? L"[wildcard]" : L"  [exact]", dp.pattern.c_str());
+    }
+    LogProxyInfo(L"--- End of domain rules ---");
 }
 
 bool NetworkFilterPlugin::IsRunning() {
@@ -327,7 +337,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     
     std::string method, url, version;
     if (!ParseRequestLine(requestLine, method, url, version)) {
-        LogError(L"[NetworkFilterPlugin] Invalid request line: %hs", requestLine.c_str());
+        LogProxyError(L"Invalid request line from client");
         SendErrorResponse(clientSocket, 400, "Bad Request", "Invalid request line");
         closesocket(client);
         return false;
@@ -335,7 +345,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     
     std::string domain = ExtractDomainFromUrl(url);
     if (domain.empty()) {
-        LogError(L"[NetworkFilterPlugin] Could not extract domain from URL: %hs", url.c_str());
+        LogProxyError(L"Could not extract domain from URL");
         SendErrorResponse(clientSocket, 400, "Bad Request", "Invalid URL");
         closesocket(client);
         return false;
@@ -344,18 +354,20 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     std::wstring domainW = StringToWide(domain);
     
     bool allowed = false;
+    std::wstring matchedPatternStr;
     for (const auto& pattern : g_State.allowedDomains) {
         if (MatchDomainPattern(pattern.pattern, domainW)) {
-            LogInfo(L"[NetworkFilterPlugin] Request ALLOWED: method=%hs, domain=%ls (pattern: %ls)",
-                     method.c_str(), domainW.c_str(), pattern.pattern.c_str());
+            matchedPatternStr = pattern.pattern;
             allowed = true;
             break;
         }
     }
     
-    if (!allowed) {
-        LogWarn(L"[NetworkFilterPlugin] Request BLOCKED: method=%hs, domain=%ls",
-                  method.c_str(), domainW.c_str());
+    std::wstring methodW = StringToWide(method);
+    if (allowed) {
+        LogProxyAllow(methodW.c_str(), domainW.c_str(), matchedPatternStr.c_str());
+    } else {
+        LogProxyBlock(methodW.c_str(), domainW.c_str(), L"no matching rule");
         SendErrorResponse(clientSocket, 403, "Forbidden", 
                        "Access to this domain is not allowed by network filter");
         closesocket(client);
@@ -373,6 +385,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     if (_stricmp(method.c_str(), "CONNECT") == 0) {
         void* serverSocket = nullptr;
         if (!ConnectToServer(host, port, serverSocket)) {
+            LogProxyError(L"CONNECT tunnel failed: cannot reach %hs:%d", host.c_str(), port);
             SendErrorResponse(clientSocket, 502, "Bad Gateway", 
                            "Failed to connect to target server");
             closesocket(client);
@@ -388,6 +401,7 @@ bool NetworkFilterPlugin::HandleClientConnection(void* clientSocket) {
     } else {
         void* serverSocket = nullptr;
         if (!ConnectToServer(host, port, serverSocket)) {
+            LogProxyError(L"HTTP forward failed: cannot reach %hs:%d", host.c_str(), port);
             SendErrorResponse(clientSocket, 502, "Bad Gateway", 
                            "Failed to connect to target server");
             closesocket(client);
