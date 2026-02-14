@@ -644,11 +644,8 @@ static void DeleteSubdirectoriesOfRoot(const std::wstring& root) {
         return;
     }
     if (!DirectoryExists(r)) {
-        LogInfo(L"[Cleanup] Root not found, skip: %ls", r.c_str());
         return;
     }
-
-    LogDebug(L"[Cleanup] Enumerating subdirectories of: %ls", r.c_str());
 
     std::wstring search = r;
     if (!search.empty() && search.back() != L'\\') search.push_back(L'\\');
@@ -674,10 +671,8 @@ static void DeleteSubdirectoriesOfRoot(const std::wstring& root) {
         if (!child.empty() && child.back() != L'\\') child.push_back(L'\\');
         child.append(fd.cFileName);
 
-        LogDebug(L"[Cleanup] Deleting subdir: %ls (attrs=0x%08lX)", child.c_str(), fd.dwFileAttributes);
         DWORD dw = DeleteTreeNoFollow(child);
         if (dw == ERROR_SUCCESS) {
-            LogInfo(L"[Cleanup] Deleted subdir: %ls", child.c_str());
             ++deletedCount;
         } else {
             LogWarn(L"[Cleanup] Failed to delete subdir: %ls (%lu)", child.c_str(), dw);
@@ -686,15 +681,12 @@ static void DeleteSubdirectoriesOfRoot(const std::wstring& root) {
     } while (FindNextFileW(hFind, &fd));
 
     FindClose(hFind);
-    LogInfo(L"[Cleanup] Subdirectory cleanup for %ls: %d deleted, %d failed", r.c_str(), deletedCount, failedCount);
 }
 
 static void CleanupAllowedPathSubdirs() {
-    LogInfo(L"[Cleanup] Starting cleanup of %llu allowed path(s)...", (unsigned long long)AllowedPaths.size());
     for (const auto& p : AllowedPaths) {
         DeleteSubdirectoriesOfRoot(p);
     }
-    LogInfo(L"[Cleanup] Allowed path subdirectory cleanup complete.");
 }
 
 static std::wstring JoinPath(const std::wstring& base, const std::wstring& leaf) {
@@ -893,18 +885,15 @@ static void FixShellForAppContainer() {
         LogWarn(L"[ShellCompat] SHELL=%ls is MSYS2/Cygwin, incompatible with AppContainer.", currentShell.c_str());
         UpsertEnvOverride(L"SHELL", safeShell);
         UpsertEnvOverride(L"COMSPEC", safeShell);
-        LogInfo(L"[ShellCompat] Override SHELL=%ls for AppContainer compatibility.", safeShell.c_str());
         return;
     }
 
     // Case 2: SHELL not set -> OpenCode/Node will search PATH and find bash.exe -> preempt
     if (currentShell.empty()) {
         UpsertEnvOverride(L"SHELL", safeShell);
-        LogInfo(L"[ShellCompat] SHELL was empty, set to %ls for AppContainer compatibility.", safeShell.c_str());
         return;
     }
 
-    LogDebug(L"[ShellCompat] SHELL=%ls appears safe, no override.", currentShell.c_str());
 }
 
 static bool ResolveSubstPath(const std::wstring& inputPath, std::wstring* resolvedPath) {
@@ -944,12 +933,10 @@ static void ResolveExePathIfSubst() {
     std::wstring image = ParseImagePathFromCommandLine(ExeToLaunch);
     if (image.empty()) return;
 
-    LogDebug(L"[SubstResolve] Checking if exe path is on SUBST drive: %ls", image.c_str());
-
     std::wstring resolved;
     if (ResolveSubstPath(image, &resolved)) {
         if (!PathEqualsInsensitive(image, resolved)) {
-            LogInfo(L"[SubstResolve] Executable path is on a SUBST drive. Resolving '%ls' -> '%ls'", image.c_str(), resolved.c_str());
+            LogWarn(L"[SubstResolve] Executable is on SUBST drive: '%ls' -> '%ls'", image.c_str(), resolved.c_str());
 
             const wchar_t* p = ExeToLaunch;
             while (*p && IsSpace(*p)) ++p;
@@ -983,12 +970,7 @@ static void ResolveExePathIfSubst() {
             g_CmdLineBuf.assign(newCmd.begin(), newCmd.end());
             g_CmdLineBuf.push_back(L'\0');
             ExeToLaunch = g_CmdLineBuf.data();
-            LogInfo(L"[SubstResolve] New command line: %ls", ExeToLaunch);
-        } else {
-            LogDebug(L"[SubstResolve] Path already resolved, no change needed.");
         }
-    } else {
-        LogDebug(L"[SubstResolve] Not a SUBST drive or resolution not needed.");
     }
 }
 
@@ -997,13 +979,11 @@ static void UpsertEnvOverride(const std::wstring& key, const std::wstring& value
 
     for (auto& kv : EnvOverrides) {
         if (IEquals(kv.name, key)) {
-            LogDebug(L"[Env] Updating existing override: %ls = %ls (was: %ls)", key.c_str(), value.c_str(), kv.value.c_str());
             kv.value = value;
             return;
         }
     }
 
-    LogDebug(L"[Env] Adding new override: %ls = %ls", key.c_str(), value.c_str());
     EnvOverrides.push_back(EnvKV{ key, value });
 }
 
@@ -1016,11 +996,9 @@ static std::wstring GetExeDir();  // forward declaration (defined in INI Config 
 static void SetEnvDefaultIfAbsent(const std::wstring& key, const std::wstring& value) {
     for (const auto& kv : EnvOverrides) {
         if (IEquals(kv.name, key)) {
-            LogDebug(L"[EnvDefault] Skipping '%ls' (already set to '%ls')", key.c_str(), kv.value.c_str());
             return;
         }
     }
-    LogInfo(L"[EnvDefault] Setting default: %ls = %ls", key.c_str(), value.c_str());
     EnvOverrides.push_back(EnvKV{ key, value });
 }
 
@@ -1037,8 +1015,6 @@ static void ApplyDefaultOpenCodeEnvPaths() {
     std::wstring cacheDir  = JoinPath(baseDir, L"cache");
     std::wstring dataDir   = JoinPath(baseDir, L"data");
     std::wstring tempDir   = JoinPath(baseDir, L"temp");
-
-    LogInfo(L"[EnvDefault] Setting up default OpenCode env paths under: %ls", exeDir.c_str());
 
     // Create directories
     CreateDirectoryW(baseDir.c_str(), nullptr);
@@ -1063,12 +1039,9 @@ static void ApplyDefaultOpenCodeEnvPaths() {
     // Auto-add all subdirs to AllowedPaths
     std::wstring dirs[] = { baseDir, workDir, configDir, cacheDir, dataDir, tempDir };
     for (const auto& d : dirs) {
-        if (AddAllowedPathUnique(d)) {
-            LogInfo(L"[EnvDefault] Auto-allowed path: %ls", d.c_str());
-        }
+        if (AddAllowedPathUnique(d)) {}
     }
 
-    LogInfo(L"[EnvDefault] Default OpenCode env paths applied.");
 }
 
 static void ApplyBunOpenTuiCompatibility() {
@@ -1077,18 +1050,14 @@ static void ApplyBunOpenTuiCompatibility() {
     std::wstring imagePath = ParseImagePathFromCommandLine(ExeToLaunch);
     bool bunDetected = LooksLikeBunImage(imagePath) || CommandLineMentionsBun(ExeToLaunch);
     if (!bunDetected) {
-        LogDebug(L"[BunCompat] Not a Bun invocation, skipping compatibility setup.");
         return;
     }
-
-    LogInfo(L"[BunCompat] Bun runtime detected in command line.");
 
     std::wstring bunInstall = TrimCopy(GetEnvVarCopy(L"BUN_INSTALL"));
     if (bunInstall.empty() && !imagePath.empty()) {
         std::wstring imageDir = GetParentDir(imagePath);
         if (IEquals(GetFileNamePart(imageDir), L"bin")) {
             bunInstall = GetParentDir(imageDir);
-            LogDebug(L"[BunCompat] Inferred BUN_INSTALL from image path: %ls", bunInstall.c_str());
         }
     }
 
@@ -1097,7 +1066,6 @@ static void ApplyBunOpenTuiCompatibility() {
         return;
     }
 
-    LogInfo(L"[BunCompat] BUN_INSTALL = %ls", bunInstall.c_str());
     bool changed = false;
 
     auto applyBase = [&](const std::wstring& base, PCWSTR sourceTag) {
@@ -1106,28 +1074,19 @@ static void ApplyBunOpenTuiCompatibility() {
         std::wstring rootPath = JoinPath(base, L"root");
         std::wstring binPath = JoinPath(base, L"bin");
 
-        LogDebug(L"%ls Checking paths: root=%ls, bin=%ls", sourceTag, rootPath.c_str(), binPath.c_str());
-
         if (DirectoryExists(rootPath)) {
             if (AddAllowedPathUnique(rootPath)) {
-                LogInfo(L"%ls Auto allow path: %ls", sourceTag, rootPath.c_str());
                 changed = true;
             }
             if (AddPathPrependUnique(rootPath)) {
-                LogInfo(L"%ls Auto PATH prepend: %ls", sourceTag, rootPath.c_str());
                 changed = true;
             }
-        } else {
-            LogDebug(L"%ls root path does not exist: %ls", sourceTag, rootPath.c_str());
         }
 
         if (DirectoryExists(binPath)) {
             if (AddPathPrependUnique(binPath)) {
-                LogInfo(L"%ls Auto PATH prepend: %ls", sourceTag, binPath.c_str());
                 changed = true;
             }
-        } else {
-            LogDebug(L"%ls bin path does not exist: %ls", sourceTag, binPath.c_str());
         }
     };
 
@@ -1138,15 +1097,9 @@ static void ApplyBunOpenTuiCompatibility() {
         !PathEqualsInsensitive(bunInstall, resolvedInstall) &&
         DirectoryExists(resolvedInstall)) {
         UpsertEnvOverride(L"BUN_INSTALL", resolvedInstall);
-        LogInfo(L"[BunCompat] Remap BUN_INSTALL for child: %ls -> %ls", bunInstall.c_str(), resolvedInstall.c_str());
         applyBase(resolvedInstall, L"[BunCompat]");
     }
 
-    if (changed) {
-        LogInfo(L"[BunCompat] Applied OpenTUI runtime compatibility settings.");
-    } else {
-        LogInfo(L"[BunCompat] No additional Bun path changes were needed.");
-    }
 }
 
 // ========================================================================
@@ -1211,7 +1164,6 @@ static bool ParseCapabilityList(WCHAR* caps) {
         sidInfo.Attributes = SE_GROUP_ENABLED;
 
         if (ConvertStringSidToSidW(cap.c_str(), &sidInfo.Sid)) {
-            LogDebug(L"[Caps] Parsed SID string: %ls", cap.c_str());
             CapabilityList.emplace_back(sidInfo);
             continue;
         }
@@ -1222,7 +1174,6 @@ static bool ParseCapabilityList(WCHAR* caps) {
         DWORD capSidsLen = 0;
 
         if (DeriveCapabilitySidsFromName(cap.c_str(), &capGroupSids, &capGroupSidsLen, &capSids, &capSidsLen)) {
-            LogDebug(L"[Caps] Derived %lu capability SIDs from name: %ls", capSidsLen, cap.c_str());
             for (DWORD i = 0; i < capSidsLen; ++i) {
                 CapabilityList.emplace_back(SID_AND_ATTRIBUTES{ capSids[i], SE_GROUP_ENABLED });
             }
@@ -1245,11 +1196,7 @@ static bool ParseAllowedPathList(WCHAR* paths) {
     for (WCHAR* tok = wcstok_s(paths, L";", &ctx); tok != nullptr; tok = wcstok_s(nullptr, L";", &ctx)) {
         std::wstring p = TrimCopy(tok);
         if (!p.empty()) {
-            if (AddAllowedPathUnique(p)) {
-                LogInfo(L"Allowed path added: %ls", p.c_str());
-            } else {
-                LogDebug(L"Allowed path ignored (duplicate): %ls", p.c_str());
-            }
+            if (AddAllowedPathUnique(p)) {}
         }
     }
     return true;
@@ -1269,7 +1216,6 @@ static bool ParseEnvList(WCHAR* env) {
 
         if (!k.empty() && k.find(L'=') == std::wstring::npos) {
             EnvOverrides.push_back(EnvKV{ k, v });
-            LogInfo(L"Env override added: %ls = %ls", k.c_str(), v.c_str());
         } else {
             LogWarn(L"Ignored invalid env token: %ls", pair.c_str());
         }
@@ -1285,11 +1231,7 @@ static bool ParsePathPrependList(WCHAR* paths) {
     for (WCHAR* tok = wcstok_s(paths, L";", &ctx); tok != nullptr; tok = wcstok_s(nullptr, L";", &ctx)) {
         std::wstring p = TrimCopy(tok);
         if (!p.empty()) {
-            if (AddPathPrependUnique(p)) {
-                LogInfo(L"PATH prepend added: %ls", p.c_str());
-            } else {
-                LogDebug(L"PATH prepend ignored (duplicate): %ls", p.c_str());
-            }
+            if (AddPathPrependUnique(p)) {}
         }
     }
 
@@ -1325,24 +1267,19 @@ static bool ParsePathPrependListFromArg(PCWSTR arg) {
 }
 
 static bool ParseArguments(int argc, WCHAR** argv) {
-    LogDebug(L"[Args] Parsing %d command-line arguments...", argc);
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != L'-' && argv[i][0] != L'/') {
-            LogDebug(L"[Args] Skipping non-option arg[%d]: %ls", i, argv[i]);
             continue;
         }
 
-        LogDebug(L"[Args] Processing arg[%d]: %ls", i, argv[i]);
         switch (argv[i][1]) {
         case L'i':
             if (i + 1 >= argc) { PrintUsage(); return false; }
             ExeToLaunch = argv[++i];
-            LogInfo(L"[Args] exe = %ls", ExeToLaunch);
             break;
         case L'm':
             if (i + 1 >= argc) { PrintUsage(); return false; }
             PackageMoniker = argv[++i];
-            LogInfo(L"[Args] moniker = %ls", PackageMoniker.c_str());
             break;
         case L'c':
             if (i + 1 >= argc) { PrintUsage(); return false; }
@@ -1351,7 +1288,6 @@ static bool ParseArguments(int argc, WCHAR** argv) {
         case L'd':
             if (i + 1 >= argc) { PrintUsage(); return false; }
             PackageDisplayName = argv[++i];
-            LogInfo(L"[Args] displayName = %ls", PackageDisplayName.c_str());
             break;
         case L'a':
             if (i + 1 >= argc) { PrintUsage(); return false; }
@@ -1365,22 +1301,19 @@ static bool ParseArguments(int argc, WCHAR** argv) {
             if (i + 1 >= argc) { PrintUsage(); return false; }
             if (!ParsePathPrependListFromArg(argv[++i])) return false;
             break;
-        case L's': PathLowIntegrity = false; LogDebug(L"[Args] lowIntegrity disabled"); break;
-        case L'w': WaitForExit = true; LogDebug(L"[Args] wait=true"); break;
-        case L'r': RetainProfile = true; LogDebug(L"[Args] retainProfile=true"); break;
-        case L'l': LaunchAsLpac = true; LogDebug(L"[Args] lpac=true"); break;
-        case L'k': NoWin32k = true; LogDebug(L"[Args] noWin32k=true"); break;
-        case L'x': CleanupAllowedSubdirs = true; LogDebug(L"[Args] cleanupSubdirs=true"); break;
-        case L'g': g_LogEnabled = true; LogDebug(L"[Args] log=true"); break;
+        case L's': PathLowIntegrity = false; break;
+        case L'w': WaitForExit = true; break;
+        case L'r': RetainProfile = true; break;
+        case L'l': LaunchAsLpac = true; break;
+        case L'k': NoWin32k = true; break;
+        case L'x': CleanupAllowedSubdirs = true; break;
+        case L'g': g_LogEnabled = true; break;
         default:
             LogWarn(L"[Args] Unknown option: %ls", argv[i]);
             break;
         }
     }
 
-    LogInfo(L"[Args] Parse complete: %llu capabilities, %llu allowed paths, %llu env overrides, %llu path prepends",
-            (unsigned long long)CapabilityList.size(), (unsigned long long)AllowedPaths.size(),
-            (unsigned long long)EnvOverrides.size(), (unsigned long long)PathPrependEntries.size());
     return true;
 }
 
@@ -1392,8 +1325,6 @@ static DWORD CreateAppContainerProfileWithMoniker(PSID* pAppContainerSid) {
     *pAppContainerSid = nullptr;
 
     PCWSTR display = PackageDisplayName.empty() ? PackageMoniker.c_str() : PackageDisplayName.c_str();
-    LogInfo(L"[Profile] Creating AppContainer profile: moniker='%ls', display='%ls', caps=%llu",
-            PackageMoniker.c_str(), display, (unsigned long long)CapabilityList.size());
 
     PSID packageSid = nullptr;
     HRESULT hr = CreateAppContainerProfile(
@@ -1405,27 +1336,13 @@ static DWORD CreateAppContainerProfileWithMoniker(PSID* pAppContainerSid) {
     if (SUCCEEDED(hr)) {
         g_ProfileWasCreated = true;
         *pAppContainerSid = packageSid;
-
-        LPWSTR sidStr = nullptr;
-        if (ConvertSidToStringSidW(packageSid, &sidStr)) {
-            LogInfo(L"[Profile] Created new profile. SID=%ls", sidStr);
-            LocalFree(sidStr);
-        } else {
-            LogInfo(L"[Profile] Created new profile successfully.");
-        }
         return ERROR_SUCCESS;
     }
 
     if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
-        LogInfo(L"[Profile] Profile already exists, deriving SID...");
         hr = DeriveAppContainerSidFromAppContainerName(PackageMoniker.c_str(), &packageSid);
         if (SUCCEEDED(hr)) {
             *pAppContainerSid = packageSid;
-            LPWSTR sidStr = nullptr;
-            if (ConvertSidToStringSidW(packageSid, &sidStr)) {
-                LogInfo(L"[Profile] Reusing existing profile. SID=%ls", sidStr);
-                LocalFree(sidStr);
-            }
             return ERROR_SUCCESS;
         }
         DWORD err = HRESULT_CODE(hr);
@@ -1439,14 +1356,12 @@ static DWORD CreateAppContainerProfileWithMoniker(PSID* pAppContainerSid) {
 }
 
 static DWORD DeleteAppContainerProfileWithMoniker() {
-    LogInfo(L"[Profile] Deleting AppContainer profile: %ls", PackageMoniker.c_str());
     HRESULT hr = DeleteAppContainerProfile(PackageMoniker.c_str());
     if (FAILED(hr)) {
         DWORD err = HRESULT_CODE(hr);
         LogWarn(L"[Profile] DeleteAppContainerProfile failed: hr=0x%08lX, err=%lu", (DWORD)hr, err);
         return err;
     }
-    LogInfo(L"[Profile] Profile deleted successfully.");
     return ERROR_SUCCESS;
 }
 
@@ -1454,7 +1369,6 @@ static DWORD DeleteAppContainerProfileWithMoniker() {
 // Security / ACL Management
 // ========================================================================
 static DWORD GrantFullControlToSidOnPath(PCWSTR path, PSID sid) {
-    LogDebug(L"[ACL] GrantFullControl on: %ls", path);
     PSECURITY_DESCRIPTOR sd = nullptr;
     PACL oldDacl = nullptr;
 
@@ -1483,8 +1397,6 @@ static DWORD GrantFullControlToSidOnPath(PCWSTR path, PSID sid) {
                                DACL_SECURITY_INFORMATION, nullptr, nullptr, newDacl, nullptr);
     if (dw != ERROR_SUCCESS) {
         LogError(L"[ACL] SetNamedSecurityInfoW (DACL) failed on %ls: err=%lu", path, dw);
-    } else {
-        LogDebug(L"[ACL] Successfully granted FILE_ALL_ACCESS on: %ls", path);
     }
 
     if (newDacl) LocalFree(newDacl);
@@ -1493,7 +1405,6 @@ static DWORD GrantFullControlToSidOnPath(PCWSTR path, PSID sid) {
 }
 
 static DWORD SetLowIntegrityLabel(PCWSTR path) {
-    LogDebug(L"[ACL] Setting Low Integrity label on: %ls", path);
     PSECURITY_DESCRIPTOR sd = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &sd, nullptr)) {
@@ -1515,8 +1426,6 @@ static DWORD SetLowIntegrityLabel(PCWSTR path) {
                                      LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, sacl);
     if (dw != ERROR_SUCCESS) {
         LogWarn(L"[ACL] SetNamedSecurityInfoW (SACL/LowIntegrity) failed on %ls: err=%lu (needs elevation)", path, dw);
-    } else {
-        LogDebug(L"[ACL] Low Integrity label set successfully on: %ls", path);
     }
 
     LocalFree(sd);
@@ -1532,7 +1441,6 @@ static DWORD RestoreDaclWithProtection(const SavedSecurity& ss) {
 }
 
 static DWORD SaveOriginalSecurityForPath(PCWSTR path) {
-    LogDebug(L"[Security] Saving original security descriptor for: %ls", path);
     SavedSecurity ss{};
     ss.path = path;
 
@@ -1545,7 +1453,6 @@ static DWORD SaveOriginalSecurityForPath(PCWSTR path) {
         if (GetSecurityDescriptorControl(ss.sdDacl, &ctrl, &rev)) {
             ss.daclProtected = (ctrl & SE_DACL_PROTECTED) != 0;
         }
-        LogInfo(L"[Security] Backed up DACL for %ls (protected=%d, revision=%lu)", path, ss.daclProtected ? 1 : 0, rev);
     } else {
         LogWarn(L"[Security] Failed to backup DACL for %ls (err=%lu)", path, daclErr);
     }
@@ -1554,7 +1461,6 @@ static DWORD SaveOriginalSecurityForPath(PCWSTR path) {
                                           nullptr, nullptr, nullptr, &ss.sacl, &ss.sdSacl);
     if (saclErr == ERROR_SUCCESS) {
         ss.hasSacl = true;
-        LogInfo(L"[Security] Backed up Label SACL for %ls", path);
     } else {
         LogWarn(L"[Security] Failed to backup Label SACL for %ls (err=%lu)", path, saclErr);
     }
@@ -1565,14 +1471,12 @@ static DWORD SaveOriginalSecurityForPath(PCWSTR path) {
 }
 
 static void RestoreSavedSecurity() {
-    LogInfo(L"[Revert] Restoring original security on %llu path(s)...", (unsigned long long)g_SavedSecurity.size());
     int restoredDacl = 0, restoredSacl = 0, failedDacl = 0, failedSacl = 0;
 
     for (auto& ss : g_SavedSecurity) {
         if (ss.hasDacl) {
             DWORD dw = RestoreDaclWithProtection(ss);
             if (dw == ERROR_SUCCESS) {
-                LogInfo(L"[Revert] Restored DACL on %ls (protected=%d)", ss.path.c_str(), ss.daclProtected ? 1 : 0);
                 ++restoredDacl;
             } else {
                 LogWarn(L"[Revert] Failed to restore DACL on %ls (err=%lu)", ss.path.c_str(), dw);
@@ -1583,7 +1487,6 @@ static void RestoreSavedSecurity() {
             DWORD dw = SetNamedSecurityInfoW(const_cast<LPWSTR>(ss.path.c_str()), SE_FILE_OBJECT,
                                              LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, ss.sacl);
             if (dw == ERROR_SUCCESS) {
-                LogInfo(L"[Revert] Restored Label SACL on %ls", ss.path.c_str());
                 ++restoredSacl;
             } else {
                 LogWarn(L"[Revert] Failed to restore Label SACL on %ls (err=%lu)", ss.path.c_str(), dw);
@@ -1601,18 +1504,14 @@ static void RestoreSavedSecurity() {
 
 static void RestoreSavedSecurityOnce() {
     if (InterlockedCompareExchange(&g_RestoreDone, 1, 0) != 0) {
-        LogDebug(L"[Revert] RestoreSavedSecurityOnce already executed, skipping.");
         return;
     }
     if (InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
         RestoreSavedSecurity();
-    } else {
-        LogDebug(L"[Revert] No path ACLs were modified, nothing to restore.");
     }
 }
 
 static void GrantAccessToAllowedPaths(PSID appContainerSid) {
-    LogInfo(L"[Permissions] Granting access to %llu allowed path(s)...", (unsigned long long)AllowedPaths.size());
     int grantedCount = 0, skippedCount = 0, failedCount = 0;
 
     for (const auto& path : AllowedPaths) {
@@ -1630,8 +1529,6 @@ static void GrantAccessToAllowedPaths(PSID appContainerSid) {
             continue;
         }
 
-        LogDebug(L"[Permissions] Processing path: %ls (attrs=0x%08lX)", path.c_str(), attrs);
-
         SaveOriginalSecurityForPath(path.c_str());
         SavedSecurity* backup = g_SavedSecurity.empty() ? nullptr : &g_SavedSecurity.back();
         bool modifiedThisPath = false;
@@ -1640,7 +1537,6 @@ static void GrantAccessToAllowedPaths(PSID appContainerSid) {
             DWORD dw = GrantFullControlToSidOnPath(path.c_str(), appContainerSid);
             if (dw == ERROR_SUCCESS) {
                 wprintf(L"[OK] Granted (F) to %ls\r\n", path.c_str());
-                LogInfo(L"[Permissions] Granted FILE_ALL_ACCESS on %ls", path.c_str());
                 modifiedThisPath = true;
             } else {
                 wprintf(L"[Warn] Grant (F) failed on %ls (%lu)\r\n", path.c_str(), dw);
@@ -1653,7 +1549,6 @@ static void GrantAccessToAllowedPaths(PSID appContainerSid) {
             DWORD dw = SetLowIntegrityLabel(path.c_str());
             if (dw == ERROR_SUCCESS) {
                 wprintf(L"[OK] Low Integrity set on %ls\r\n", path.c_str());
-                LogInfo(L"[Permissions] Low Integrity set on %ls", path.c_str());
                 modifiedThisPath = true;
             } else {
                 wprintf(L"[Warn] Set Low Integrity failed on %ls (%lu)\r\n", path.c_str(), dw);
@@ -1697,9 +1592,6 @@ static bool InitConPtyApi() {
     g_ConPtyAvailable = (g_pfnCreatePC != nullptr && g_pfnClosePC != nullptr);
     if (!g_ConPtyAvailable) {
         LogWarn(L"[ConPTY] CreatePseudoConsole not available on this OS.");
-    } else {
-        LogDebug(L"[ConPTY] API loaded: CreatePseudoConsole=%p, ClosePseudoConsole=%p",
-                 (void*)g_pfnCreatePC, (void*)g_pfnClosePC);
     }
     return g_ConPtyAvailable;
 }
@@ -1711,13 +1603,11 @@ static COORD GetCurrentConsoleSize() {
         COORD sz;
         sz.X = csbi.srWindow.Right  - csbi.srWindow.Left + 1;
         sz.Y = csbi.srWindow.Bottom - csbi.srWindow.Top  + 1;
-        LogDebug(L"[ConPTY] Console size: %dx%d", sz.X, sz.Y);
         return sz;
     }
     COORD fallback;
     fallback.X = 120;
     fallback.Y = 30;
-    LogDebug(L"[ConPTY] Using fallback console size: %dx%d", fallback.X, fallback.Y);
     return fallback;
 }
 
@@ -1747,7 +1637,6 @@ static DWORD WINAPI ConPtyInputRelay(LPVOID param) {
         totalRelayed += bytesRead;
     }
 done:
-    LogDebug(L"[ConPTY] Input relay thread exiting. Total bytes relayed: %lu", totalRelayed);
     return 0;
 }
 
@@ -1769,7 +1658,6 @@ static DWORD WINAPI ConPtyOutputRelay(LPVOID param) {
         totalRelayed += bytesRead;
     }
 done:
-    LogDebug(L"[ConPTY] Output relay thread exiting. Total bytes relayed: %lu", totalRelayed);
     return 0;
 }
 
@@ -1791,8 +1679,6 @@ static std::wstring GetExeDir();
 
 // Search binary for ASCII filename matching "opentui-XXXX.dll"
 static std::wstring FindDllNameInBinary(const BYTE* data, size_t dataSize) {
-    LogDebug(L"[BunVFS] Scanning %llu bytes for DLL name pattern 'opentui-*.dll'...",
-             (unsigned long long)dataSize);
     const char* pat = "opentui-";
     size_t patLen = 8;
     int candidateCount = 0;
@@ -1817,12 +1703,7 @@ static std::wstring FindDllNameInBinary(const BYTE* data, size_t dataSize) {
             size_t nameLen = (j + 4) - i;
             std::string name(reinterpret_cast<const char*>(data + i), nameLen);
             std::wstring wname(name.begin(), name.end());
-            LogInfo(L"[BunVFS] Found DLL name at offset 0x%llX: '%ls' (scanned %d candidates)",
-                    (unsigned long long)i, wname.c_str(), candidateCount);
             return wname;
-        } else {
-            LogDebug(L"[BunVFS] Candidate #%d at offset 0x%llX did not end with '.dll', skipping.",
-                     candidateCount, (unsigned long long)i);
         }
     }
 
@@ -1911,14 +1792,11 @@ static bool PEDllExportsSymbol(const BYTE* peBase, size_t peSize,
     DWORD exportRVA  = *reinterpret_cast<const DWORD*>(peBase + dataDirOff);
     DWORD exportSize = *reinterpret_cast<const DWORD*>(peBase + dataDirOff + 4);
     if (exportRVA == 0 || exportSize == 0) {
-        LogDebug(L"[BunVFS/Export] No export directory (RVA=0x%lX, size=0x%lX)", exportRVA, exportSize);
         return false;
     }
 
     DWORD exportFileOff = RvaToFileOffset(peBase, peSize, exportRVA);
     if (exportFileOff == 0 || exportFileOff + 40 > peSize) {
-        LogDebug(L"[BunVFS/Export] Export directory RVA 0x%lX -> file offset 0x%lX (invalid or out of bounds)",
-                 exportRVA, exportFileOff);
         return false;
     }
 
@@ -1936,12 +1814,8 @@ static bool PEDllExportsSymbol(const BYTE* peBase, size_t peSize,
             const char* dn = reinterpret_cast<const char*>(peBase + dllNameOff);
             size_t maxLen = peSize - dllNameOff;
             size_t len = strnlen(dn, maxLen > 260 ? 260 : maxLen);
-            LogDebug(L"[BunVFS/Export] Export DLL name: '%.260S'", dn);
         }
     }
-
-    LogDebug(L"[BunVFS/Export] Export directory: RVA=0x%lX, fileOff=0x%lX, numberOfNames=%lu, namesRVA=0x%lX",
-             exportRVA, exportFileOff, numberOfNames, namesRVA);
 
     if (outExportCount) *outExportCount = static_cast<int>(numberOfNames);
 
@@ -1953,7 +1827,6 @@ static bool PEDllExportsSymbol(const BYTE* peBase, size_t peSize,
 
     DWORD namesFileOff = RvaToFileOffset(peBase, peSize, namesRVA);
     if (namesFileOff == 0 || namesFileOff + numberOfNames * 4 > peSize) {
-        LogDebug(L"[BunVFS/Export] Names array out of bounds: fileOff=0x%lX", namesFileOff);
         return false;
     }
 
@@ -1972,15 +1845,12 @@ static bool PEDllExportsSymbol(const BYTE* peBase, size_t peSize,
 
         // Log first 20 exports and any match
         if (printedCount < 20) {
-            LogDebug(L"[BunVFS/Export]   [%lu] '%.260S'", i, name);
             ++printedCount;
         } else if (printedCount == 20) {
-            LogDebug(L"[BunVFS/Export]   ... (%lu more exports not shown)", numberOfNames - 20);
             ++printedCount;
         }
 
         if (len == symbolLen && memcmp(name, symbolName, symbolLen) == 0) {
-            LogInfo(L"[BunVFS/Export] *** Found target symbol '%S' at export index %lu ***", symbolName, i);
             found = true;
             // Don't break - continue logging to show full picture
         }
@@ -2019,9 +1889,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
     WORD optHeaderSize  = *reinterpret_cast<const WORD*>(base + coffOff + 16);
     WORD characteristics = *reinterpret_cast<const WORD*>(base + coffOff + 18);
 
-    LogDebug(L"[BunVFS/PE] COFF header: machine=0x%04X, sections=%u, optHdrSize=%u, chars=0x%04X",
-             machine, numSections, optHeaderSize, characteristics);
-
     if (!(characteristics & 0x2000)) return 0;  // IMAGE_FILE_DLL
     if (machine != 0x014C && machine != 0x8664) return 0;
     if (numSections == 0 || numSections > 96) return 0;
@@ -2034,8 +1901,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
     bool isPE32Plus = (optMagic == 0x020B);
     bool isPE32     = (optMagic == 0x010B);
     if (!isPE32 && !isPE32Plus) return 0;
-
-    LogDebug(L"[BunVFS/PE] Format: %ls", isPE32Plus ? L"PE32+ (64-bit)" : L"PE32 (32-bit)");
 
     if (isPE32Plus && machine != 0x8664) return 0;
     if (isPE32 && machine != 0x014C) return 0;
@@ -2053,9 +1918,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
         sizeOfImage = *reinterpret_cast<const DWORD*>(base + optOff + 56);
     }
 
-    LogDebug(L"[BunVFS/PE] SizeOfHeaders=0x%lX, FileAlignment=0x%lX, SizeOfImage=0x%lX",
-             sizeOfHeaders, fileAlignment, sizeOfImage);
-
     DWORD numDataDirs = 0;
     size_t dataDirOff = 0;
     if (isPE32) {
@@ -2068,8 +1930,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
         dataDirOff = optOff + 112;
     }
     if (numDataDirs > 16) numDataDirs = 16;
-
-    LogDebug(L"[BunVFS/PE] NumberOfRvaAndSizes=%lu", numDataDirs);
 
     size_t sectionTableOff = optOff + optHeaderSize;
     if (sectionTableOff + numSections * 40 > maxLen) return 0;
@@ -2085,17 +1945,12 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
         DWORD rawSize = *reinterpret_cast<const DWORD*>(base + shOff + 16);
         DWORD rawPtr  = *reinterpret_cast<const DWORD*>(base + shOff + 20);
 
-        LogDebug(L"[BunVFS/PE]   Section[%u] '%.8S': RawSize=0x%lX, RawPtr=0x%lX",
-                 s, secName, rawSize, rawPtr);
-
         if (rawSize > 0 && rawPtr > 0) {
             size_t end = static_cast<size_t>(rawPtr) + rawSize;
             if (end > maxLen) return 0;
             if (end > totalSize) totalSize = end;
         }
     }
-
-    LogDebug(L"[BunVFS/PE] Size after sections: 0x%llX", (unsigned long long)totalSize);
 
     // 2) Certificate / Authenticode table (index 4) - uses FILE OFFSET, not RVA
     if (numDataDirs > 4) {
@@ -2107,8 +1962,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
                 size_t certEnd = static_cast<size_t>(certFileOffset) + certSize;
                 if (certEnd > maxLen) return 0;
                 if (certEnd > totalSize) totalSize = certEnd;
-                LogInfo(L"[BunVFS/PE] Certificate data: offset=0x%lX, size=0x%lX, end=0x%llX",
-                        certFileOffset, certSize, (unsigned long long)certEnd);
             }
         }
     }
@@ -2124,8 +1977,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
                 if (dbgFileOff > 0) {
                     // Each IMAGE_DEBUG_DIRECTORY is 28 bytes
                     DWORD numEntries = dbgSize / 28;
-                    LogDebug(L"[BunVFS/PE] Debug directory: RVA=0x%lX, fileOff=0x%lX, entries=%lu",
-                             dbgRVA, dbgFileOff, numEntries);
                     for (DWORD d = 0; d < numEntries && dbgFileOff + d * 28 + 28 <= maxLen; ++d) {
                         size_t entOff = dbgFileOff + d * 28;
                         DWORD dbgDataSize = *reinterpret_cast<const DWORD*>(base + entOff + 16);
@@ -2133,8 +1984,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
                         if (dbgDataSize > 0 && dbgDataPtr > 0) {
                             size_t dbgEnd = static_cast<size_t>(dbgDataPtr) + dbgDataSize;
                             if (dbgEnd <= maxLen && dbgEnd > totalSize) {
-                                LogDebug(L"[BunVFS/PE]   Debug entry[%lu]: rawPtr=0x%lX, size=0x%lX, extends total to 0x%llX",
-                                         d, dbgDataPtr, dbgDataSize, (unsigned long long)dbgEnd);
                                 totalSize = dbgEnd;
                             }
                         }
@@ -2144,8 +1993,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
         }
     }
 
-    LogDebug(L"[BunVFS/PE] Size after cert+debug: 0x%llX", (unsigned long long)totalSize);
-
     // 4) Align total size up to FileAlignment
     size_t unalignedSize = totalSize;
     if (fileAlignment > 1) {
@@ -2153,16 +2000,7 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
         if (totalSize > maxLen) totalSize = maxLen;
     }
 
-    if (totalSize != unalignedSize) {
-        LogDebug(L"[BunVFS/PE] Size after alignment to 0x%lX: 0x%llX (was 0x%llX)",
-                 fileAlignment, (unsigned long long)totalSize, (unsigned long long)unalignedSize);
-    }
-
     if (totalSize < 4096) return 0;
-
-    LogInfo(L"[BunVFS/PE] Validated DLL: %ls, %u sections, computed size=%llu bytes (0x%llX)",
-            isPE32Plus ? L"PE32+(x64)" : L"PE32(x86)",
-            numSections, (unsigned long long)totalSize, (unsigned long long)totalSize);
 
     return totalSize;
 }
@@ -2170,7 +2008,6 @@ static size_t ValidatePEDllAndGetCompleteSize(const BYTE* base, size_t maxLen) {
 // After extraction, verify the DLL is loadable by checking key PE structures
 // and also verifying that expected exports (like "setLogCallback") exist.
 static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = true) {
-    LogInfo(L"[BunVFS/Verify] Verifying extracted DLL: %ls", dllPath.c_str());
 
     HANDLE hFile = CreateFileW(dllPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2182,9 +2019,6 @@ static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = 
     LARGE_INTEGER li{};
     GetFileSizeEx(hFile, &li);
     size_t fileSize = static_cast<size_t>(li.QuadPart);
-
-    LogDebug(L"[BunVFS/Verify] File size: %llu bytes (0x%llX)",
-             (unsigned long long)fileSize, (unsigned long long)fileSize);
 
     if (fileSize < 4096) {
         CloseHandle(hFile);
@@ -2215,7 +2049,6 @@ static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = 
         valid = false;
         goto done;
     }
-    LogDebug(L"[BunVFS/Verify] PASS: MZ signature present");
 
     {
         DWORD peOff = *reinterpret_cast<const DWORD*>(base + 0x3C);
@@ -2229,7 +2062,6 @@ static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = 
             valid = false;
             goto done;
         }
-        LogDebug(L"[BunVFS/Verify] PASS: PE signature at offset 0x%lX", peOff);
 
         // 2) DLL flag
         WORD chars = *reinterpret_cast<const WORD*>(base + peOff + 4 + 18);
@@ -2238,14 +2070,11 @@ static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = 
             valid = false;
             goto done;
         }
-        LogDebug(L"[BunVFS/Verify] PASS: DLL flag set (chars=0x%04X)", chars);
 
         // 3) All sections' raw data must be within file bounds
         WORD numSections = *reinterpret_cast<const WORD*>(base + peOff + 4 + 2);
         WORD optSize = *reinterpret_cast<const WORD*>(base + peOff + 4 + 16);
         size_t secOff = peOff + 4 + 20 + optSize;
-
-        LogDebug(L"[BunVFS/Verify] Checking %u sections for file bounds...", numSections);
 
         for (WORD s = 0; s < numSections && secOff + s * 40 + 40 <= fileSize; ++s) {
             size_t sh = secOff + s * 40;
@@ -2262,10 +2091,8 @@ static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = 
                     valid = false;
                     goto done;
                 }
-                LogDebug(L"[BunVFS/Verify]   Section[%u] '%.8S': OK (end=0x%llX)", s, secName, (unsigned long long)end);
             }
         }
-        LogDebug(L"[BunVFS/Verify] PASS: All sections within file bounds");
 
         // 4) Check export directory and verify expected symbols
         if (checkExports) {
@@ -2278,16 +2105,12 @@ static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = 
                 goto done;
             }
 
-            LogInfo(L"[BunVFS/Verify] DLL has %d exports, setLogCallback=%ls",
-                    exportCount, hasSetLogCallback ? L"FOUND" : L"NOT FOUND");
-
             if (!hasSetLogCallback) {
                 LogError(L"[BunVFS/Verify] FAIL: Required symbol 'setLogCallback' not found in exports.");
                 LogError(L"[BunVFS/Verify]   This PE DLL is likely the wrong embedded image.");
                 valid = false;
                 goto done;
             }
-            LogInfo(L"[BunVFS/Verify] PASS: Required export 'setLogCallback' present");
         }
 
         // 5) Check certificate data bounds
@@ -2309,7 +2132,6 @@ static bool VerifyExtractedDll(const std::wstring& dllPath, bool checkExports = 
                     valid = false;
                     goto done;
                 }
-                LogDebug(L"[BunVFS/Verify] Certificate: offset=0x%lX, size=0x%lX", certOff, certSize);
             }
         }
     }
@@ -2319,10 +2141,7 @@ done:
     CloseHandle(hMap);
     CloseHandle(hFile);
 
-    if (valid) {
-        LogInfo(L"[BunVFS/Verify] ===== DLL VERIFICATION PASSED ===== %ls (%llu bytes)",
-                dllPath.c_str(), (unsigned long long)fileSize);
-    } else {
+    if (valid) {} else {
         LogError(L"[BunVFS/Verify] ===== DLL VERIFICATION FAILED ===== %ls", dllPath.c_str());
     }
     return valid;
@@ -2343,10 +2162,6 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
                                        const std::wstring& outDir,
                                        const std::wstring& dllName,
                                        std::wstring& outPath) {
-    LogInfo(L"[BunVFS/Extract] Starting DLL extraction from: %ls", exePath.c_str());
-    LogInfo(L"[BunVFS/Extract] Output directory: %ls", outDir.c_str());
-    LogInfo(L"[BunVFS/Extract] Expected DLL name: %ls", dllName.empty() ? L"(auto-detect)" : dllName.c_str());
-
     HANDLE hFile = CreateFileW(exePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -2361,8 +2176,6 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
         return false;
     }
     size_t fileSize = static_cast<size_t>(li.QuadPart);
-    LogInfo(L"[BunVFS/Extract] Exe file size: %llu bytes (%.2f MB)",
-            (unsigned long long)fileSize, (double)fileSize / (1024.0 * 1024.0));
 
     HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
     if (!hMap) {
@@ -2386,21 +2199,12 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
     size_t scanStart = 0x10000;  // 64KB - skip past main exe PE header area
     if (scanStart >= fileSize) scanStart = 4096;
 
-    LogInfo(L"[BunVFS/Extract] Phase 1: Scanning for ALL embedded PE DLL candidates...");
-    LogInfo(L"[BunVFS/Extract]   Scan range: 0x%llX to 0x%llX",
-            (unsigned long long)scanStart, (unsigned long long)fileSize);
-
     DWORD scanStartTick = GetTickCount();
 
     for (size_t off = scanStart; off + 0x200 < fileSize; ++off) {
         if (base[off] != 'M' || base[off + 1] != 'Z') continue;
 
         ++mzCandidates;
-        if (mzCandidates <= 10 || mzCandidates % 50 == 0) {
-            LogDebug(L"[BunVFS/Extract] MZ candidate #%d at offset 0x%llX (%.1f%%)",
-                     mzCandidates, (unsigned long long)off,
-                     100.0 * (double)off / (double)fileSize);
-        }
 
         size_t remaining = fileSize - off;
         size_t peSize = ValidatePEDllAndGetCompleteSize(base + off, remaining);
@@ -2417,11 +2221,6 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
         cand.exportCount = exportCount;
         candidates.push_back(cand);
 
-        LogInfo(L"[BunVFS/Extract] Valid PE DLL #%llu at offset 0x%llX: size=%llu bytes, exports=%d, setLogCallback=%ls",
-                (unsigned long long)candidates.size(), (unsigned long long)off,
-                (unsigned long long)peSize, exportCount,
-                hasExport ? L"YES" : L"NO");
-
         // Skip past this PE image to avoid finding sub-images
         if (peSize > 0x200) {
             off += peSize - 1;  // -1 because the for loop will ++off
@@ -2429,8 +2228,6 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
     }
 
     DWORD scanElapsed = GetTickCount() - scanStartTick;
-    LogInfo(L"[BunVFS/Extract] Phase 1 complete in %lu ms: %d MZ candidates, %llu valid PE DLLs found",
-            scanElapsed, mzCandidates, (unsigned long long)candidates.size());
 
     if (candidates.empty()) {
         LogWarn(L"[BunVFS/Extract] No valid PE DLL found in exe. DLL may be compressed/encrypted.");
@@ -2442,14 +2239,9 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
 
     // Phase 2: Select best candidate
     // Priority: candidates with "setLogCallback" export, then largest by export count
-    LogInfo(L"[BunVFS/Extract] Phase 2: Selecting best candidate from %llu options...",
-            (unsigned long long)candidates.size());
 
     const PECandidate* best = nullptr;
     for (const auto& c : candidates) {
-        LogDebug(L"[BunVFS/Extract]   Candidate: offset=0x%llX, size=%llu, exports=%d, hasTarget=%ls",
-                 (unsigned long long)c.offset, (unsigned long long)c.size,
-                 c.exportCount, c.hasTargetExport ? L"YES" : L"NO");
 
         if (!best) {
             best = &c;
@@ -2472,10 +2264,6 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
         return false;
     }
 
-    LogInfo(L"[BunVFS/Extract] Selected candidate: offset=0x%llX, size=%llu bytes, exports=%d, hasTarget=%ls",
-            (unsigned long long)best->offset, (unsigned long long)best->size,
-            best->exportCount, best->hasTargetExport ? L"YES" : L"NO");
-
     if (!best->hasTargetExport) {
         LogWarn(L"[BunVFS/Extract] WARNING: No candidate has 'setLogCallback' export! "
                 L"Extracting best available, but LoadLibrary/GetProcAddress may still fail.");
@@ -2486,8 +2274,6 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
     outPath = outDir;
     if (!outPath.empty() && outPath.back() != L'\\') outPath += L'\\';
     outPath += name;
-
-    LogInfo(L"[BunVFS/Extract] Phase 3: Extracting to %ls...", outPath.c_str());
 
     bool found = false;
     HANDLE hOut = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0,
@@ -2515,14 +2301,10 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
 
         if (writeOk) {
             CloseHandle(hOut);
-            LogInfo(L"[BunVFS/Extract] Wrote %llu bytes to %ls",
-                    (unsigned long long)written_total, outPath.c_str());
 
             // Final verification on the extracted file
-            LogInfo(L"[BunVFS/Extract] Running post-extraction verification...");
             if (VerifyExtractedDll(outPath, true)) {
                 found = true;
-                LogInfo(L"[BunVFS/Extract] Extraction and verification SUCCESSFUL.");
             } else {
                 LogError(L"[BunVFS/Extract] Post-extraction verification FAILED!");
                 // Try with expanded size: maybe we need more data from the file
@@ -2548,7 +2330,6 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
                         CloseHandle(hOut);
                         if (writeOk && VerifyExtractedDll(outPath, true)) {
                             found = true;
-                            LogInfo(L"[BunVFS/Extract] Expanded extraction SUCCEEDED: %llu bytes.", (unsigned long long)remainingSize);
                         } else {
                             LogError(L"[BunVFS/Extract] Expanded extraction also FAILED. Deleting.");
                             DeleteFileW(outPath.c_str());
@@ -2567,7 +2348,9 @@ static bool ExtractEmbeddedDllFromExe(const std::wstring& exePath,
     CloseHandle(hMap);
     CloseHandle(hFile);
 
-    LogInfo(L"[BunVFS/Extract] Final result: %ls", found ? L"SUCCESS" : L"FAILED");
+    if (!found) {
+        LogError(L"[BunVFS/Extract] DLL extraction FAILED. OpenCode may not start correctly.");
+    }
     return found;
 }
 
@@ -2577,15 +2360,11 @@ static std::wstring ResolveExeFullPath(PCWSTR exeName) {
     std::wstring image = ParseImagePathFromCommandLine(exeName);
     if (image.empty()) return L"";
 
-    LogDebug(L"[BunVFS/Resolve] Resolving exe path for: %ls", image.c_str());
-
     if (image.find(L'\\') != std::wstring::npos || image.find(L'/') != std::wstring::npos) {
         DWORD attrs = GetFileAttributesW(image.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            LogDebug(L"[BunVFS/Resolve] Direct path exists: %ls", image.c_str());
             return image;
         }
-        LogDebug(L"[BunVFS/Resolve] Direct path not found: %ls", image.c_str());
         return L"";
     }
 
@@ -2594,7 +2373,6 @@ static std::wstring ResolveExeFullPath(PCWSTR exeName) {
         std::wstring c = JoinPath(exeDir, image);
         DWORD a = GetFileAttributesW(c.c_str());
         if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
-            LogDebug(L"[BunVFS/Resolve] Found in exe directory: %ls", c.c_str());
             return c;
         }
     }
@@ -2603,7 +2381,6 @@ static std::wstring ResolveExeFullPath(PCWSTR exeName) {
         std::wstring c = JoinPath(p, image);
         DWORD a = GetFileAttributesW(c.c_str());
         if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
-            LogDebug(L"[BunVFS/Resolve] Found in allowed path: %ls", c.c_str());
             return c;
         }
     }
@@ -2611,7 +2388,6 @@ static std::wstring ResolveExeFullPath(PCWSTR exeName) {
     wchar_t fullPath[MAX_PATH * 2] = {};
     DWORD n = SearchPathW(nullptr, image.c_str(), L".exe", _countof(fullPath), fullPath, nullptr);
     if (n > 0 && n < _countof(fullPath)) {
-        LogDebug(L"[BunVFS/Resolve] Found via SearchPathW: %ls", fullPath);
         return std::wstring(fullPath, n);
     }
 
@@ -2622,28 +2398,21 @@ static std::wstring ResolveExeFullPath(PCWSTR exeName) {
 // Create B:\~BUN\root\ on disk, extract embedded DLL, and map B: drive
 static bool PrepareBunVirtualDrive(PSID appContainerSid) {
     if (!ExeToLaunch) {
-        LogDebug(L"[BunVFS] No exe to launch, skipping virtual drive setup.");
         return false;
     }
 
     std::wstring image = ParseImagePathFromCommandLine(ExeToLaunch);
     std::wstring nameLower = ToLowerCopy(GetFileNamePart(image));
 
-    LogDebug(L"[BunVFS] Checking if exe needs Bun virtual drive: name='%ls'", nameLower.c_str());
-
     if (nameLower.find(L"opencode") == std::wstring::npos) {
-        LogDebug(L"[BunVFS] Not an OpenCode executable, skipping virtual drive.");
         return false;
     }
-
-    LogInfo(L"[BunVFS] ====== Starting Bun Virtual Drive Setup ======");
 
     // Check if B: is already in use (e.g. a real fixed drive on the system).
     // If so, we CANNOT map our staging dir to B:, but we MUST still extract
     // the DLL and set up fallback paths (PATH prepend)
     // so the child process can find the opentui DLL.
     UINT driveType = GetDriveTypeW(L"B:\\");
-    LogDebug(L"[BunVFS] B: drive type: %u", driveType);
     bool bDriveAvailable = (driveType == DRIVE_NO_ROOT_DIR || driveType == 0);
     if (!bDriveAvailable) {
         LogWarn(L"[BunVFS] B: drive already exists (type=%u). Will skip B: mapping but still extract DLL for fallback paths.", driveType);
@@ -2655,8 +2424,6 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
         return false;
     }
 
-    LogInfo(L"[BunVFS] Resolved exe path: %ls", exeFullPath.c_str());
-
     // Get exe file info
     {
         WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -2667,9 +2434,6 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
             FILETIME ft = fad.ftLastWriteTime;
             SYSTEMTIME st{};
             FileTimeToSystemTime(&ft, &st);
-            LogInfo(L"[BunVFS] Exe info: size=%llu bytes (%.2f MB), modified=%04u-%02u-%02u %02u:%02u:%02u",
-                    sz.QuadPart, (double)sz.QuadPart / (1024.0 * 1024.0),
-                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         }
     }
 
@@ -2683,8 +2447,6 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
     std::wstring bunDir = JoinPath(g_BunStagingDir, L"~BUN");
     std::wstring dllDir = JoinPath(bunDir, L"root");
 
-    LogInfo(L"[BunVFS] Staging layout: %ls -> ~BUN -> root", g_BunStagingDir.c_str());
-
     CreateDirectoryW(g_BunStagingDir.c_str(), nullptr);
     CreateDirectoryW(bunDir.c_str(), nullptr);
     CreateDirectoryW(dllDir.c_str(), nullptr);
@@ -2695,7 +2457,6 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
     }
 
     // Find expected DLL name from binary
-    LogInfo(L"[BunVFS] Scanning exe for embedded DLL name...");
     std::wstring dllName;
     {
         HANDLE hF = CreateFileW(exeFullPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -2716,9 +2477,7 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
         }
     }
 
-    if (!dllName.empty()) {
-        LogInfo(L"[BunVFS] Expected DLL name: %ls", dllName.c_str());
-    } else {
+    if (!dllName.empty()) {} else {
         LogWarn(L"[BunVFS] Could not find DLL name pattern in exe.");
     }
 
@@ -2729,10 +2488,7 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
         dllPath = JoinPath(dllDir, dllName);
         DWORD a = GetFileAttributesW(dllPath.c_str());
         if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
-            LogInfo(L"[BunVFS] Found existing DLL: %ls", dllPath.c_str());
-            LogInfo(L"[BunVFS] Re-verifying (including export check)...");
             if (VerifyExtractedDll(dllPath, true)) {
-                LogInfo(L"[BunVFS] Existing DLL verified OK, reusing.");
                 alreadyExtracted = true;
             } else {
                 LogWarn(L"[BunVFS] Existing DLL FAILED verification! Deleting and re-extracting.");
@@ -2742,11 +2498,9 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
     }
 
     if (!alreadyExtracted) {
-        LogInfo(L"[BunVFS] Starting DLL extraction (with export validation)...");
         std::wstring extractedPath;
         if (ExtractEmbeddedDllFromExe(exeFullPath, dllDir, dllName, extractedPath)) {
             dllPath = extractedPath;
-            LogInfo(L"[BunVFS] DLL extraction successful: %ls", dllPath.c_str());
         } else {
             LogWarn(L"[BunVFS] Could not extract DLL. Mapping B: anyway for Bun's own attempt.");
         }
@@ -2759,43 +2513,32 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
     // Fallback 1: Add DLL staging directory to PATH prepend
     // This allows LoadLibrary("opentui-xxx.dll") to find it via PATH search.
     if (!dllDir.empty() && DirectoryExists(dllDir)) {
-        if (AddPathPrependUnique(dllDir)) {
-            LogInfo(L"[BunVFS] Fallback 1: Added DLL directory to PATH prepend: %ls", dllDir.c_str());
-        }
+        if (AddPathPrependUnique(dllDir)) {}
     }
 
     // Grant AppContainer full access
     if (appContainerSid) {
-        LogInfo(L"[BunVFS] Granting AppContainer access to staging dir...");
         DWORD dw = GrantFullControlToSidOnPath(g_BunStagingDir.c_str(), appContainerSid);
-        if (dw == ERROR_SUCCESS) {
-            LogInfo(L"[BunVFS] Granted FILE_ALL_ACCESS on: %ls", g_BunStagingDir.c_str());
-        } else {
+        if (dw == ERROR_SUCCESS) {} else {
             LogWarn(L"[BunVFS] Grant (F) failed: %ls (err=%lu)", g_BunStagingDir.c_str(), dw);
         }
     }
 
     // Map B: -> staging dir (only if B: is not already in use)
     if (bDriveAvailable) {
-        LogInfo(L"[BunVFS] Mapping B: -> %ls", g_BunStagingDir.c_str());
         if (DefineDosDeviceW(0, L"B:", g_BunStagingDir.c_str())) {
             g_BunDriveMapped = true;
             g_BunDriveTarget = g_BunStagingDir;
-            LogInfo(L"[BunVFS] DefineDosDeviceW succeeded.");
             LogWarn(L"[BunVFS] Note: B: mapping may not be visible inside AppContainer due to namespace isolation.");
         } else {
             DWORD err = GetLastError();
             LogWarn(L"[BunVFS] DefineDosDeviceW failed (err=%lu) - non-fatal, fallback paths available.", err);
         }
-    } else {
-        LogInfo(L"[BunVFS] Skipping B: mapping (drive already in use, type=%u).", driveType);
     }
 
     // Verify B: mapping if we created one
     if (g_BunDriveMapped) {
-        if (DirectoryExists(L"B:\\~BUN\\root")) {
-            LogInfo(L"[BunVFS] Verified: B:\\~BUN\\root is accessible.");
-        } else {
+        if (DirectoryExists(L"B:\\~BUN\\root")) {} else {
             LogWarn(L"[BunVFS] B:\\~BUN\\root NOT accessible after mapping!");
         }
     }
@@ -2812,27 +2555,11 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
                 ULARGE_INTEGER sz;
                 sz.HighPart = fd.nFileSizeHigh;
                 sz.LowPart = fd.nFileSizeLow;
-                LogInfo(L"[BunVFS]   File: %ls (%llu bytes)", fd.cFileName, sz.QuadPart);
                 ++fileCount;
             } while (FindNextFileW(hFind, &fd));
             FindClose(hFind);
-            LogInfo(L"[BunVFS] DLL directory: %d file(s).", fileCount);
         }
     }
-
-    // Confirm kernel mapping (if we created one)
-    if (g_BunDriveMapped) {
-        wchar_t devTarget[4096] = {};
-        DWORD n = QueryDosDeviceW(L"B:", devTarget, _countof(devTarget));
-        if (n > 0) LogInfo(L"[BunVFS] QueryDosDeviceW('B:'): '%ls'", devTarget);
-    }
-
-    // Log fallback summary
-    LogInfo(L"[BunVFS] DLL loading fallback mechanisms:");
-    LogInfo(L"[BunVFS]   1. B: drive mapping: %ls",
-            g_BunDriveMapped ? L"ACTIVE (may not be visible in AppContainer)" : L"NOT AVAILABLE");
-    if (!dllDir.empty() && DirectoryExists(dllDir))
-        LogInfo(L"[BunVFS]   2. DLL in PATH: %ls", dllDir.c_str());
 
     // === Fallback 2: Copy DLL to %LOCALAPPDATA%\.bun\~BUN\root\ ===
     // When B: drive is not visible inside AppContainer, Bun's runtime may
@@ -2870,8 +2597,6 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
             if (!dup) candidateBases[numCandidates++] = AllowedPaths[0];
         }
 
-        LogInfo(L"[BunVFS] Fallback 2: Creating .bun mirror directories (%d candidates)...", numCandidates);
-
         for (int i = 0; i < numCandidates; ++i) {
             std::wstring bunFallbackBase = JoinPath(candidateBases[i], L".bun");
             std::wstring bunFallbackBun  = JoinPath(bunFallbackBase, L"~BUN");
@@ -2885,13 +2610,10 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
             if (DirectoryExists(bunFallbackRoot)) {
                 // Copy DLL to fallback location (overwrite if exists)
                 if (CopyFileW(dllPath.c_str(), bunFallbackDll.c_str(), FALSE)) {
-                    LogInfo(L"[BunVFS]   Fallback 2[%d]: Copied DLL to %ls", i, bunFallbackDll.c_str());
                     g_BunFallbackDirs.push_back(bunFallbackBase);
 
                     // Add to PATH prepend
-                    if (AddPathPrependUnique(bunFallbackRoot)) {
-                        LogInfo(L"[BunVFS]   Fallback 2[%d]: Added to PATH: %ls", i, bunFallbackRoot.c_str());
-                    }
+                    if (AddPathPrependUnique(bunFallbackRoot)) {}
 
                     // Grant AppContainer access to the .bun tree
                     if (appContainerSid) {
@@ -2909,51 +2631,38 @@ static bool PrepareBunVirtualDrive(PSID appContainerSid) {
             }
         }
 
-        LogInfo(L"[BunVFS]   3. .bun fallback directories: CONFIGURED");
     }
 
-    LogInfo(L"[BunVFS] ====== Bun Virtual Drive Setup Complete ======");
     return true;
 }
 
 // Thread-safe cleanup: remove B: drive mapping
 static void CleanupBunVirtualDrive() {
     if (InterlockedCompareExchange(&g_BunCleanupDone, 1, 0) != 0) {
-        LogDebug(L"[BunVFS/Cleanup] Already cleaned up, skipping.");
         return;
     }
 
     // Step 1: Remove B: drive mapping (if active)
     if (g_BunDriveMapped) {
-        LogInfo(L"[BunVFS/Cleanup] Removing B: -> %ls ...", g_BunDriveTarget.c_str());
 
         if (DefineDosDeviceW(DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE,
-                             L"B:", g_BunDriveTarget.c_str())) {
-            LogInfo(L"[BunVFS/Cleanup] B: drive mapping removed.");
-        } else {
+                             L"B:", g_BunDriveTarget.c_str())) {} else {
             DWORD err = GetLastError();
             LogWarn(L"[BunVFS/Cleanup] Failed to remove B: mapping (err=%lu). May need: subst B: /d", err);
         }
 
         UINT driveType = GetDriveTypeW(L"B:\\");
-        if (driveType == DRIVE_NO_ROOT_DIR || driveType == 0) {
-            LogInfo(L"[BunVFS/Cleanup] Verified: B: drive removed (type=%u).", driveType);
-        } else {
+        if (driveType == DRIVE_NO_ROOT_DIR || driveType == 0) {} else {
             LogWarn(L"[BunVFS/Cleanup] B: still exists (type=%u)!", driveType);
         }
 
         g_BunDriveMapped = false;
-    } else {
-        LogDebug(L"[BunVFS/Cleanup] No B: mapping to remove.");
     }
 
     // Step 2: Delete staging directory (.bun-vfs)
     if (!g_BunStagingDir.empty() && DirectoryExists(g_BunStagingDir)) {
-        LogInfo(L"[BunVFS/Cleanup] Deleting staging directory: %ls", g_BunStagingDir.c_str());
         DWORD dw = DeleteTreeNoFollow(g_BunStagingDir);
-        if (dw == ERROR_SUCCESS) {
-            LogInfo(L"[BunVFS/Cleanup] Staging directory deleted successfully.");
-        } else {
+        if (dw == ERROR_SUCCESS) {} else {
             LogWarn(L"[BunVFS/Cleanup] Failed to delete staging directory: %ls (err=%lu)", g_BunStagingDir.c_str(), dw);
         }
     }
@@ -2961,11 +2670,8 @@ static void CleanupBunVirtualDrive() {
     // Step 3: Delete .bun fallback directories
     for (const auto& fbDir : g_BunFallbackDirs) {
         if (!fbDir.empty() && DirectoryExists(fbDir)) {
-            LogInfo(L"[BunVFS/Cleanup] Deleting .bun fallback: %ls", fbDir.c_str());
             DWORD dw = DeleteTreeNoFollow(fbDir);
-            if (dw == ERROR_SUCCESS) {
-                LogInfo(L"[BunVFS/Cleanup] Fallback directory deleted: %ls", fbDir.c_str());
-            } else {
+            if (dw == ERROR_SUCCESS) {} else {
                 LogWarn(L"[BunVFS/Cleanup] Failed to delete fallback: %ls (err=%lu)", fbDir.c_str(), dw);
             }
         }
@@ -2974,7 +2680,6 @@ static void CleanupBunVirtualDrive() {
 }
 
 static void AtExitCleanupBunDrive() {
-    LogDebug(L"[BunVFS/Cleanup] atexit handler invoked.");
     CleanupBunVirtualDrive();
 }
 
@@ -2992,12 +2697,8 @@ static LONG WINAPI BunDriveCrashHandler(EXCEPTION_POINTERS* ep) {
 // ========================================================================
 static bool BuildChildEnvBlockFromOverrides() {
     if (EnvOverrides.empty() && PathPrependEntries.empty()) {
-        LogDebug(L"[Env] No overrides or PATH prepends, skipping env block build.");
         return false;
     }
-
-    LogInfo(L"[Env] Building child environment block: %llu overrides, %llu PATH prepends",
-            (unsigned long long)EnvOverrides.size(), (unsigned long long)PathPrependEntries.size());
 
     LPWCH env = GetEnvironmentStringsW();
     std::vector<std::wstring> rawSpecial;
@@ -3018,8 +2719,8 @@ static bool BuildChildEnvBlockFromOverrides() {
             p += len + 1;
         }
         FreeEnvironmentStringsW(env);
-        LogDebug(L"[Env] Inherited %d vars from parent (%llu special, %llu normal)",
-                 totalVars, (unsigned long long)rawSpecial.size(), (unsigned long long)vars.size());
+    } else {
+        LogWarn(L"[Env] GetEnvironmentStringsW failed: err=%lu", GetLastError());
     }
 
     for (const auto& ov : EnvOverrides) {
@@ -3027,14 +2728,12 @@ static bool BuildChildEnvBlockFromOverrides() {
         bool replaced = false;
         for (auto& cur : vars) {
             if (IEquals(cur.name, ov.name)) {
-                LogDebug(L"[Env] Override: %ls = '%ls' (was: '%ls')", ov.name.c_str(), ov.value.c_str(), cur.value.c_str());
                 cur.value = ov.value;
                 replaced = true;
                 break;
             }
         }
         if (!replaced) {
-            LogDebug(L"[Env] New var: %ls = '%ls'", ov.name.c_str(), ov.value.c_str());
             vars.push_back(ov);
         }
     }
@@ -3051,13 +2750,10 @@ static bool BuildChildEnvBlockFromOverrides() {
                                    [](const EnvKV& kv) { return _wcsicmp(kv.name.c_str(), L"PATH") == 0; });
             if (it == vars.end()) {
                 vars.push_back(EnvKV{ L"PATH", prependJoined });
-                LogDebug(L"[Env] Created new PATH: %ls", prependJoined.c_str());
             } else if (it->value.empty()) {
                 it->value = prependJoined;
-                LogDebug(L"[Env] Set empty PATH to: %ls", prependJoined.c_str());
             } else {
                 it->value = prependJoined + L";" + it->value;
-                LogDebug(L"[Env] Prepended to PATH: %ls", prependJoined.c_str());
             }
         }
     }
@@ -3078,8 +2774,6 @@ static bool BuildChildEnvBlockFromOverrides() {
     }
     g_ChildEnv.push_back(L'\0');
 
-    LogInfo(L"[Env] Child env block ready: %llu vars, %llu wchars total",
-            (unsigned long long)vars.size(), (unsigned long long)g_ChildEnv.size());
     return true;
 }
 
@@ -3089,11 +2783,9 @@ static bool BuildChildEnvBlockFromOverrides() {
 static DWORD LaunchProcess(PSID packageSid) {
     DWORD result = ERROR_SUCCESS;
 
-    LogInfo(L"[Launch] Preparing to launch child process...");
-    LogInfo(L"[Launch]   Command: %ls", ExeToLaunch);
-    LogInfo(L"[Launch]   Wait: %ls, LPAC: %ls, NoWin32k: %ls, NewConsole: %ls",
-            WaitForExit ? L"yes" : L"no", LaunchAsLpac ? L"yes" : L"no",
-            NoWin32k ? L"yes" : L"no", UseNewConsole ? L"yes" : L"no");
+    LogInfo(L"[Launch] Starting: %ls (wait=%ls, lpac=%ls, newConsole=%ls)",
+            ExeToLaunch, WaitForExit ? L"yes" : L"no",
+            LaunchAsLpac ? L"yes" : L"no", UseNewConsole ? L"yes" : L"no");
 
     bool useConPty = false;
     void* hPC = nullptr;
@@ -3105,7 +2797,6 @@ static DWORD LaunchProcess(PSID packageSid) {
     bool inputModeChanged = false, outputModeChanged = false;
 
     if (WaitForExit && !UseNewConsole && UseConPty && InitConPtyApi()) {
-        LogInfo(L"[Launch] Setting up ConPTY pseudoconsole...");
         SECURITY_ATTRIBUTES sa{};
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = TRUE;
@@ -3118,7 +2809,6 @@ static DWORD LaunchProcess(PSID packageSid) {
             HRESULT hr = g_pfnCreatePC(conSize, hPipeIn_R, hPipeOut_W, 0, &hPC);
             if (SUCCEEDED(hr)) {
                 useConPty = true;
-                LogInfo(L"[Launch] ConPTY created successfully: %dx%d", conSize.X, conSize.Y);
             } else {
                 LogWarn(L"[Launch] CreatePseudoConsole failed: hr=0x%08lX", (DWORD)hr);
             }
@@ -3142,9 +2832,12 @@ static DWORD LaunchProcess(PSID packageSid) {
     //   Output: ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
     //           | DISABLE_NEWLINE_AUTO_RETURN
     if (!useConPty && !UseNewConsole && WaitForExit) {
-        LogInfo(L"[Launch] Setting console to raw mode for child TUI (AppContainer cannot SetConsoleMode)...");
         HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
         HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hStdin == INVALID_HANDLE_VALUE || hStdout == INVALID_HANDLE_VALUE) {
+            LogWarn(L"[Launch] Cannot get console handles for raw mode (stdin=%p, stdout=%p). TUI may not work.",
+                    hStdin, hStdout);
+        }
         if (hStdin != INVALID_HANDLE_VALUE && GetConsoleMode(hStdin, &savedInputMode)) {
             // Raw mode: ONLY VT input. Disables ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT,
             // ENABLE_PROCESSED_INPUT so each keypress (including Enter) is delivered
@@ -3152,7 +2845,6 @@ static DWORD LaunchProcess(PSID packageSid) {
             DWORD newMode = ENABLE_VIRTUAL_TERMINAL_INPUT;
             if (SetConsoleMode(hStdin, newMode)) {
                 inputModeChanged = true;
-                LogInfo(L"[Launch] Console input: raw mode set (0x%lX -> 0x%lX)", savedInputMode, newMode);
             } else {
                 LogWarn(L"[Launch] Failed to set raw input mode: err=%lu", GetLastError());
                 // Fallback: try just adding VT flag
@@ -3167,23 +2859,16 @@ static DWORD LaunchProcess(PSID packageSid) {
             DWORD newMode = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
             if (SetConsoleMode(hStdout, newMode)) {
                 outputModeChanged = true;
-                LogInfo(L"[Launch] Console output: VT mode set (0x%lX -> 0x%lX)", savedOutputMode, newMode);
             } else {
                 LogWarn(L"[Launch] Failed to set VT output mode: err=%lu", GetLastError());
             }
         }
     }
 
-    if (UseNewConsole) LogInfo(L"[Launch] Using CREATE_NEW_CONSOLE mode.");
-    else if (useConPty) LogInfo(L"[Launch] Using ConPTY pseudoconsole for child process.");
-    else LogInfo(L"[Launch] Sharing current console with child process.");
-
     DWORD attributeCount = 1;
     if (LaunchAsLpac) ++attributeCount;
     if (NoWin32k) ++attributeCount;
     if (useConPty) ++attributeCount;
-
-    LogDebug(L"[Launch] Proc thread attribute count: %lu", attributeCount);
 
     SIZE_T attrListSize = 0;
     InitializeProcThreadAttributeList(nullptr, attributeCount, 0, &attrListSize);
@@ -3202,8 +2887,6 @@ static DWORD LaunchProcess(PSID packageSid) {
     sc.AppContainerSid = packageSid;
     sc.Capabilities = CapabilityList.data();
     sc.CapabilityCount = static_cast<DWORD>(CapabilityList.size());
-
-    LogDebug(L"[Launch] Security capabilities: SID=%p, CapCount=%lu", packageSid, sc.CapabilityCount);
 
     do {
         if (!InitializeProcThreadAttributeList(attrList, attributeCount, 0, &attrListSize)) {
@@ -3224,7 +2907,6 @@ static DWORD LaunchProcess(PSID packageSid) {
                 LogError(L"[Launch] UpdateProcThreadAttribute(ALL_APP_PACKAGES_POLICY) failed: err=%lu", result);
                 break;
             }
-            LogDebug(L"[Launch] LPAC policy set.");
         }
         if (NoWin32k) {
             mitigationPolicy = PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON;
@@ -3234,7 +2916,6 @@ static DWORD LaunchProcess(PSID packageSid) {
                 LogError(L"[Launch] UpdateProcThreadAttribute(MITIGATION_POLICY) failed: err=%lu", result);
                 break;
             }
-            LogDebug(L"[Launch] Win32k lockdown mitigation set.");
         }
         if (useConPty && hPC) {
             if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
@@ -3243,7 +2924,6 @@ static DWORD LaunchProcess(PSID packageSid) {
                 LogError(L"[Launch] UpdateProcThreadAttribute(PSEUDOCONSOLE) failed: err=%lu", result);
                 break;
             }
-            LogDebug(L"[Launch] Pseudoconsole attribute set.");
         }
 
         si.StartupInfo.cb = sizeof(si);
@@ -3252,9 +2932,6 @@ static DWORD LaunchProcess(PSID packageSid) {
         LPVOID envBlock = nullptr;
         if (!g_ChildEnv.empty()) { envBlock = g_ChildEnv.data(); createFlags |= CREATE_UNICODE_ENVIRONMENT; }
         if (UseNewConsole && !useConPty) createFlags |= CREATE_NEW_CONSOLE;
-
-        LogInfo(L"[Launch] Calling CreateProcessAsUserW (flags=0x%08lX, envBlock=%ls)...",
-                createFlags, envBlock ? L"custom" : L"inherited");
 
         if (!CreateProcessAsUserW(nullptr, nullptr, ExeToLaunch, nullptr, nullptr, FALSE,
                                   createFlags, envBlock, nullptr, &si.StartupInfo, &pi)) {
@@ -3281,44 +2958,35 @@ static DWORD LaunchProcess(PSID packageSid) {
         if (HideParentConsole && UseNewConsole && WaitForExit) {
             DWORD pids[16] = {};
             DWORD procCount = GetConsoleProcessList(pids, _countof(pids));
-            LogDebug(L"[Launch] Console process count: %lu", procCount);
             if (procCount <= 1) {
                 // Only this process uses the console → safe to hide (double-click)
                 HWND hwnd = GetConsoleWindow();
                 if (hwnd) {
                     ShowWindow(hwnd, SW_HIDE);
-                    LogInfo(L"[Launch] Parent console window hidden (standalone launch).");
                 }
-            } else {
-                LogDebug(L"[Launch] Running inside existing terminal (%lu processes), keeping parent console visible.", procCount);
             }
         }
 
         if (useConPty) {
-            LogDebug(L"[Launch] Setting up ConPTY relay threads...");
             HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
             HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
             if (GetConsoleMode(hStdin, &savedInputMode)) {
                 SetConsoleMode(hStdin, ENABLE_VIRTUAL_TERMINAL_INPUT);
                 inputModeChanged = true;
-                LogDebug(L"[Launch] Console input mode: 0x%lX -> 0x%lX", savedInputMode, (DWORD)ENABLE_VIRTUAL_TERMINAL_INPUT);
             }
             if (GetConsoleMode(hStdout, &savedOutputMode)) {
                 DWORD newMode = savedOutputMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
                 SetConsoleMode(hStdout, newMode);
                 outputModeChanged = true;
-                LogDebug(L"[Launch] Console output mode: 0x%lX -> 0x%lX", savedOutputMode, newMode);
             }
             hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             hRelayOut = CreateThread(nullptr, 0, ConPtyOutputRelay, hPipeOut_R, 0, nullptr);
             inputCtx.hPipeWrite = hPipeIn_W;
             inputCtx.hStopEvent = hStopEvent;
             hRelayIn = CreateThread(nullptr, 0, ConPtyInputRelay, &inputCtx, 0, nullptr);
-            LogInfo(L"[Launch] ConPTY relay threads started.");
         }
 
         if (WaitForExit) {
-            LogInfo(L"[Launch] Waiting for child process (PID=%lu) to exit...", pi.dwProcessId);
             DWORD waitStart = GetTickCount();
             WaitForSingleObject(pi.hProcess, INFINITE);
             DWORD waitElapsed = GetTickCount() - waitStart;
@@ -3326,15 +2994,23 @@ static DWORD LaunchProcess(PSID packageSid) {
             DWORD code = 0;
             if (GetExitCodeProcess(pi.hProcess, &code)) {
                 result = code;
-                LogInfo(L"[Launch] Child process exited: code=%lu (0x%08lX), runtime=%lu ms",
+                LogInfo(L"[Launch] Child exited: code=%lu (0x%08lX), runtime=%lu ms",
                         code, code, waitElapsed);
+                // Provide hints for common error exit codes
+                if (code == 0xC0000135)
+                    LogError(L"[Launch] STATUS_DLL_NOT_FOUND - child could not load a required DLL.");
+                else if (code == 126)
+                    LogError(L"[Launch] ERROR_MOD_NOT_FOUND - a DLL or module failed to load.");
+                else if (code == 0xC0000142)
+                    LogError(L"[Launch] STATUS_DLL_INIT_FAILED - DLL initialization routine failed.");
+                else if (code == 5)
+                    LogError(L"[Launch] ERROR_ACCESS_DENIED - child was denied access to a resource.");
             } else {
                 result = GetLastError();
                 LogWarn(L"[Launch] GetExitCodeProcess failed: err=%lu, runtime=%lu ms", result, waitElapsed);
             }
 
             if (useConPty) {
-                LogDebug(L"[Launch] Stopping ConPTY relay threads...");
                 if (hStopEvent) SetEvent(hStopEvent);
                 if (hPC) { g_pfnClosePC(hPC); hPC = nullptr; }
                 if (hRelayOut) { WaitForSingleObject(hRelayOut, 5000); CloseHandle(hRelayOut); hRelayOut = nullptr; }
@@ -3344,27 +3020,19 @@ static DWORD LaunchProcess(PSID packageSid) {
                 if (hStopEvent) { CloseHandle(hStopEvent); hStopEvent = nullptr; }
                 if (inputModeChanged) {
                     SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), savedInputMode);
-                    LogDebug(L"[Launch] Restored console input mode: 0x%lX", savedInputMode);
                 }
                 if (outputModeChanged) {
                     SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), savedOutputMode);
-                    LogDebug(L"[Launch] Restored console output mode: 0x%lX", savedOutputMode);
                 }
-                LogInfo(L"[Launch] ConPTY relay threads stopped, console modes restored.");
             } else if (inputModeChanged || outputModeChanged) {
                 // Restore shared console VT mode
                 if (inputModeChanged) {
                     SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), savedInputMode);
-                    LogDebug(L"[Launch] Restored console input mode: 0x%lX", savedInputMode);
                 }
                 if (outputModeChanged) {
                     SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), savedOutputMode);
-                    LogDebug(L"[Launch] Restored console output mode: 0x%lX", savedOutputMode);
                 }
-                LogInfo(L"[Launch] Shared console modes restored.");
             }
-        } else {
-            LogInfo(L"[Launch] Not waiting for child (wait=false). Parent will proceed to cleanup.");
         }
 
         if (pi.hThread) CloseHandle(pi.hThread);
@@ -3377,7 +3045,6 @@ static DWORD LaunchProcess(PSID packageSid) {
     if (hPipeOut_R) CloseHandle(hPipeOut_R);
     if (hStopEvent) CloseHandle(hStopEvent);
 
-    LogDebug(L"[Launch] LaunchProcess returning: %lu", result);
     return result;
 }
 
@@ -3440,7 +3107,6 @@ static bool IniBoolFromString(const std::wstring& s, bool defVal = false) {
 
 static bool LoadConfigFromIniIfNoArgs(int argc) {
     if (argc > 1) {
-        LogDebug(L"[Config] CLI args present (argc=%d), skipping INI load.", argc);
         return false;
     }
     std::wstring dir = GetExeDir();
@@ -3448,7 +3114,6 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
     std::wstring ini = dir + L"config.ini";
     DWORD attrs = GetFileAttributesW(ini.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        LogDebug(L"[Config] No config.ini found at: %ls", ini.c_str());
         return false;
     }
 
@@ -3457,18 +3122,17 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
     PathPrependEntries.clear(); g_ChildEnv.clear();
 
     auto moniker = TrimCopy(ReadIniString(ini, L"moniker"));
-    if (!moniker.empty()) { PackageMoniker = moniker; LogInfo(L"[Config] moniker = %ls", moniker.c_str()); }
+    if (!moniker.empty()) { PackageMoniker = moniker; }
     auto exe = TrimCopy(ReadIniString(ini, L"exe"));
     if (!exe.empty()) {
         g_CmdLineBuf.assign(exe.begin(), exe.end());
         g_CmdLineBuf.push_back(L'\0');
         ExeToLaunch = g_CmdLineBuf.data();
-        LogInfo(L"[Config] exe = %ls", exe.c_str());
     }
     auto disp = TrimCopy(ReadIniString(ini, L"displayName"));
-    if (!disp.empty()) { PackageDisplayName = disp; LogInfo(L"[Config] displayName = %ls", disp.c_str()); }
+    if (!disp.empty()) { PackageDisplayName = disp; }
     auto caps = ReadIniString(ini, L"capabilities");
-    if (!caps.empty()) { ParseCapabilityListFromArg(caps.c_str()); LogInfo(L"[Config] capabilities loaded (%llu total)", (unsigned long long)CapabilityList.size()); }
+    if (!caps.empty()) { ParseCapabilityListFromArg(caps.c_str()); }
     auto allowPaths = ReadIniString(ini, L"allowPaths");
     if (!allowPaths.empty()) { ParseAllowedPathListFromArg(allowPaths.c_str()); }
     auto env = ReadIniString(ini, L"env");
@@ -3506,10 +3170,6 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
 
     g_NetworkFilterAllowedUrls = TrimCopy(ReadIniString(ini, L"networkFilterAllowedUrls"));
 
-    LogInfo(L"[Config] networkFilter: enabled=%d, port=%d, allowedUrls=%ls",
-            g_NetworkFilterEnabled ? 1 : 0, g_NetworkFilterPort,
-            g_NetworkFilterAllowedUrls.empty() ? L"(none)" : g_NetworkFilterAllowedUrls.c_str());
-
     LogInfo(L"[Config] Final flags: wait=%d, retainProfile=%d, lpac=%d, noWin32k=%d, "
             L"lowIntegrityOnPaths=%d, cleanupSubdirs=%d, newConsole=%d, conpty=%d, hideParent=%d, log=%d, networkFilter=%d",
             WaitForExit?1:0, RetainProfile?1:0, LaunchAsLpac?1:0, NoWin32k?1:0,
@@ -3522,7 +3182,6 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
 // ========================================================================
 static bool InitializeNetworkFilter() {
     if (!g_NetworkFilterEnabled) {
-        LogDebug(L"[NetworkFilter] Disabled, skipping initialization.");
         return true;  // Not an error
     }
 
@@ -3554,7 +3213,6 @@ static void ShutdownNetworkFilter() {
         LONG blocks = InterlockedCompareExchange(&g_ProxyBlockCount, 0, 0);
         LogInfo(L"[NetworkFilter] Shutting down proxy... (session: %ld allowed, %ld blocked)", allows, blocks);
         NetworkFilterPlugin::Shutdown();
-        LogInfo(L"[NetworkFilter] Proxy stopped.");
     }
 }
 
@@ -3575,7 +3233,6 @@ static void InjectProxyEnvVars() {
     UpsertEnvOverride(L"NO_PROXY",  L"localhost,127.0.0.1");
     UpsertEnvOverride(L"no_proxy",  L"localhost,127.0.0.1");
 
-    LogInfo(L"[NetworkFilter] Injected proxy env vars: %ls", proxyUrl.c_str());
 }
 
 // ========================================================================
@@ -3588,7 +3245,6 @@ static BOOL WINAPI OnConsoleCtrl(DWORD ctrlType) {
         ShutdownNetworkFilter();
         CleanupBunVirtualDrive();
         RestoreSavedSecurityOnce();
-        LogInfo(L"[Console] Cleanup complete for console event %lu.", ctrlType);
         return TRUE;
     default:
         return FALSE;
@@ -3618,32 +3274,9 @@ int wmain(int argc, WCHAR** argv) {
     // Now that g_LogEnabled is known, initialize log file and emit startup banner.
     InitLogFile();
 
-    LogInfo(L"========================================");
-    LogInfo(L"LaunchAppContainer started (PID=%lu)", GetCurrentProcessId());
-    LogInfo(L"========================================");
-    if (g_LogEnabled && g_LogFile != INVALID_HANDLE_VALUE) {
-        LogInfo(L"[Init] Log file: %ls", g_LogFilePath.c_str());
-    }
-
-    // Log system info
-    {
-        LogDebug(L"[Init] argc=%d", argc);
-        for (int i = 0; i < argc; ++i) {
-            LogDebug(L"[Init] argv[%d] = '%ls'", i, argv[i]);
-        }
-    }
-
-    LogInfo(L"[Init] Configuration summary:");
-    LogInfo(L"[Init]   Moniker:      %ls", PackageMoniker.c_str());
-    LogInfo(L"[Init]   Exe:          %ls", ExeToLaunch);
-    LogInfo(L"[Init]   DisplayName:  %ls", PackageDisplayName.empty() ? L"(same as moniker)" : PackageDisplayName.c_str());
-    LogInfo(L"[Init]   Capabilities: %llu", (unsigned long long)CapabilityList.size());
-    LogInfo(L"[Init]   AllowedPaths: %llu", (unsigned long long)AllowedPaths.size());
-    for (size_t i = 0; i < AllowedPaths.size(); ++i) {
-        LogInfo(L"[Init]     [%llu] %ls", (unsigned long long)i, AllowedPaths[i].c_str());
-    }
-    LogInfo(L"[Init]   EnvOverrides: %llu", (unsigned long long)EnvOverrides.size());
-    LogInfo(L"[Init]   PathPrepends: %llu", (unsigned long long)PathPrependEntries.size());
+    LogInfo(L"=== LaunchAppContainer started (PID=%lu) === Moniker=%ls, Exe=%ls, AllowedPaths=%llu",
+            GetCurrentProcessId(), PackageMoniker.c_str(), ExeToLaunch,
+            (unsigned long long)AllowedPaths.size());
 
     ResolveExePathIfSubst();
     ApplyDefaultOpenCodeEnvPaths();
@@ -3654,22 +3287,14 @@ int wmain(int argc, WCHAR** argv) {
     if (WaitForExit) {
         UpsertEnvOverride(L"TERM", L"xterm-256color");
         UpsertEnvOverride(L"COLORTERM", L"truecolor");
-        LogDebug(L"[Init] Added TERM/COLORTERM env overrides for wait mode.");
     }
-
-    // NOTE: Do NOT build the child env block here. PrepareBunVirtualDrive()
-    // may add PATH prepends and env overrides that must be captured.
-    // BuildChildEnvBlockFromOverrides() is called after PrepareBunVirtualDrive().
 
     if (RegSetKeyValueW(HKEY_CURRENT_USER, L"Console", L"LowBoxConsoleEnabled",
                         REG_DWORD, &lowBoxConsoleEnabled, sizeof(lowBoxConsoleEnabled)) != ERROR_SUCCESS)
         LogWarn(L"[Init] Failed to set LowBoxConsoleEnabled registry key.");
-    else
-        LogDebug(L"[Init] LowBoxConsoleEnabled registry key set.");
 
     SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
-    LogInfo(L"[Init] Console code page set to UTF-8 (65001).");
 
     // ================================================================
     // Network Filter Plugin: Initialize proxy before child process
@@ -3682,13 +3307,7 @@ int wmain(int argc, WCHAR** argv) {
             CloseLogFile();
             return 1;
         }
-        // Initialize separate proxy log file
         InitProxyLogFile();
-        if (g_ProxyLogFile != INVALID_HANDLE_VALUE) {
-            LogInfo(L"[Phase] Proxy log file: %ls", g_ProxyLogFilePath.c_str());
-        }
-        // Inject HTTP_PROXY / HTTPS_PROXY into env overrides.
-        // Must be done BEFORE BuildChildEnvBlockFromOverrides().
         InjectProxyEnvVars();
     }
 
@@ -3703,66 +3322,54 @@ int wmain(int argc, WCHAR** argv) {
     }
 
     if (!AllowedPaths.empty()) {
-        LogInfo(L"[Phase] Granting access to allowed paths...");
         GrantAccessToAllowedPaths(appContainerSid);
     }
 
     // Prepare Bun virtual B: drive
-    LogInfo(L"[Phase] Checking/preparing Bun virtual drive...");
     PrepareBunVirtualDrive(appContainerSid);
     atexit(AtExitCleanupBunDrive);
     SetUnhandledExceptionFilter(BunDriveCrashHandler);
-    LogDebug(L"[Phase] atexit and crash handlers registered for B: drive cleanup.");
 
     // Build child environment block AFTER PrepareBunVirtualDrive() so that
     // any PATH prepends and env overrides added during BunVFS setup are included.
     if (!EnvOverrides.empty() || !PathPrependEntries.empty()) {
-        LogInfo(L"[Phase] Building child environment block (post-BunVFS)...");
         BuildChildEnvBlockFromOverrides();
     }
 
     LogInfo(L"[Phase] Launching child process...");
     result = LaunchProcess(appContainerSid);
-    LogInfo(L"[Phase] Child process finished with result: %lu (0x%08lX)", result, result);
 
     if (CleanupAllowedSubdirs && (WaitForExit || result != ERROR_SUCCESS)) {
-        LogInfo(L"[Phase] Cleaning subdirectories under allowed paths...");
         CleanupAllowedPathSubdirs();
     }
 
     if (InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
         if (WaitForExit || result != ERROR_SUCCESS) {
-            LogInfo(L"[Phase] Reverting ACL/permissions...");
             RestoreSavedSecurityOnce();
-        } else {
-            LogDebug(L"[Phase] ACLs were modified but wait=false and process succeeded. Deferring restore.");
         }
     }
 
 Cleanup:
-    LogInfo(L"[Phase] Entering cleanup...");
     ShutdownNetworkFilter();
 
     // Remove B: drive mapping
     CleanupBunVirtualDrive();
 
     if (result != ERROR_SUCCESS && InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
-        LogInfo(L"[Phase] Error path: restoring ACLs...");
         RestoreSavedSecurityOnce();
     }
     if (WaitForExit && !RetainProfile && g_ProfileWasCreated) {
-        LogInfo(L"[Phase] Deleting AppContainer profile...");
         DeleteAppContainerProfileWithMoniker();
-    } else if (RetainProfile) {
-        LogInfo(L"[Phase] Retaining AppContainer profile (retainProfile=true).");
     }
     if (appContainerSid) { FreeSid(appContainerSid); appContainerSid = nullptr; }
 
     SetConsoleCtrlHandler(OnConsoleCtrl, FALSE);
 
-    LogInfo(L"========================================");
-    LogInfo(L"LaunchAppContainer finished: result=%lu (0x%08lX)", result, result);
-    LogInfo(L"========================================");
+    LogInfo(L"=== LaunchAppContainer finished: result=%lu (0x%08lX) ===", result, result);
+    if (result != ERROR_SUCCESS && result != 0xC000013A /* STATUS_CONTROL_C_EXIT */) {
+        LogError(L"[Result] Non-zero exit. Common causes: DLL load failure (0xC0000135), "
+                 L"access denied (5), module not found (126). Check child process logs.");
+    }
     CloseProxyLogFile();
     CloseLogFile();
     return static_cast<int>(result);
