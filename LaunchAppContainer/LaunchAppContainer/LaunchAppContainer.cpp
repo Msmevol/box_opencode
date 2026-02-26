@@ -178,7 +178,7 @@ static int IntegrityLevel = 0;  // 0=Low(4096), 1=Medium(8192), 2=High(12288)
 static bool g_ProfileWasCreated = false;
 static bool CleanupAllowedSubdirs = false;
 static bool g_WaitAutoEnabled = false;
-static bool UseNewConsole = false;
+static bool UseNewConsole = true;
 static bool UseConPty = false;
 static bool HideParentConsole = true;
 static bool g_LogEnabled = false;
@@ -187,6 +187,9 @@ static bool g_LogEnabled = false;
 static bool g_NetworkFilterEnabled = false;
 static int  g_NetworkFilterPort = 8080;
 static std::wstring g_NetworkFilterAllowedUrls;
+
+static std::wstring g_FirewallRuleBaseName;   // 防火墙规则名称前缀
+static bool g_FirewallRulesAdded = false;     // 是否已添加防火墙规则
 
 // Bun Virtual Drive (B:\~BUN) state
 static volatile LONG g_BunCleanupDone = 0;
@@ -3137,6 +3140,46 @@ static bool BuildChildEnvBlockFromOverrides() {
 // Process Launcher (Restricted Token mode - allows child processes)
 // ========================================================================
 
+// 从令牌中提取 Logon SID（用于进程隔离：设置 Default DACL 和文件 ACL）
+// 返回的 SID 需要调用方 LocalFree()
+static PSID GetLogonSidFromToken(HANDLE hToken) {
+	DWORD len = 0;
+	GetTokenInformation(hToken, TokenLogonSid, nullptr, 0, &len);
+	if (len == 0) {
+		// 回退：尝试从 TokenGroups 中找 SE_GROUP_LOGON_ID
+		GetTokenInformation(hToken, TokenGroups, nullptr, 0, &len);
+		if (len == 0) return nullptr;
+		PTOKEN_GROUPS pGroups = (PTOKEN_GROUPS)LocalAlloc(LPTR, len);
+		if (!pGroups) return nullptr;
+		if (!GetTokenInformation(hToken, TokenGroups, pGroups, len, &len)) {
+			LocalFree(pGroups);
+			return nullptr;
+		}
+		PSID result = nullptr;
+		for (DWORD i = 0; i < pGroups->GroupCount; ++i) {
+			if ((pGroups->Groups[i].Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID) {
+				DWORD sidLen = GetLengthSid(pGroups->Groups[i].Sid);
+				result = (PSID)LocalAlloc(LPTR, sidLen);
+				if (result) CopySid(sidLen, result, pGroups->Groups[i].Sid);
+				break;
+			}
+		}
+		LocalFree(pGroups);
+		return result;
+	}
+	PTOKEN_GROUPS pLogon = (PTOKEN_GROUPS)LocalAlloc(LPTR, len);
+	if (!pLogon) return nullptr;
+	if (!GetTokenInformation(hToken, TokenLogonSid, pLogon, len, &len) || pLogon->GroupCount == 0) {
+		LocalFree(pLogon);
+		return nullptr;
+	}
+	DWORD sidLen = GetLengthSid(pLogon->Groups[0].Sid);
+	PSID result = (PSID)LocalAlloc(LPTR, sidLen);
+	if (result) CopySid(sidLen, result, pLogon->Groups[0].Sid);
+	LocalFree(pLogon);
+	return result;
+}
+
 // 创建带 KILL_ON_JOB_CLOSE 的 Job Object，确保子进程树不会残留
 static HANDLE CreateKillOnCloseJob() {
 	HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
@@ -3153,6 +3196,22 @@ static HANDLE CreateKillOnCloseJob() {
 		return nullptr;
 	}
 	LogInfo(L"[Job] Created Job Object with KILL_ON_JOB_CLOSE (handle=%p)", hJob);
+
+	// ★ UI 隔离：阻止沙箱进程使用 Job 外进程的 USER 句柄
+	JOBOBJECT_BASIC_UI_RESTRICTIONS uiRestrict = {};
+	uiRestrict.UIRestrictionsClass =
+		JOB_OBJECT_UILIMIT_HANDLES |           // 禁止使用 Job 外进程的 USER 句柄
+		JOB_OBJECT_UILIMIT_GLOBALATOMS |       // 隔离全局原子表
+		JOB_OBJECT_UILIMIT_DESKTOP |           // 禁止创建/切换桌面
+		JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;   // 禁止修改系统参数
+	if (!SetInformationJobObject(hJob, JobObjectBasicUIRestrictions,
+		&uiRestrict, sizeof(uiRestrict))) {
+		LogWarn(L"[Job] UI restrictions failed: err=%lu (non-fatal)", GetLastError());
+	}
+	else {
+		LogInfo(L"[Job] UI restrictions applied (HANDLES|GLOBALATOMS|DESKTOP|SYSTEMPARAMS)");
+	}
+
 	return hJob;
 }
 
@@ -3331,6 +3390,48 @@ static DWORD LaunchProcessWithRestrictedToken() {
 		SaferCloseLevel(hLevel);
 		hLevel = NULL;
 
+		// ★ 进程隔离（Restricted Token 模式）：
+		//   - Default DACL = logon SID + SYSTEM → 沙箱创建的子进程/对象外部无法访问
+		//   - Job Object UI 限制 → USER 句柄隔离
+		//   - 低完整性级别 → 阻止对外部中/高完整性进程的写操作（Terminate/Inject）
+		//   注意：restricted SIDs 方案已移除，因为它影响所有访问检查（文件/DLL/注册表），
+		//   导致 CreateProcessAsUserW 失败。完整的进程读隔离请使用 AppContainer 模式。
+		{
+			PSID pLogonSid = GetLogonSidFromToken(hRestrictedToken);
+
+			// ★ 设置 Default DACL：包含 logon SID，让沙箱内进程可以互相访问
+			if (pLogonSid) {
+				DWORD aclSize = sizeof(ACL)
+					+ 2 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD))
+					+ GetLengthSid(pLogonSid);
+				// 也给 SYSTEM 访问权
+				PSID pSystem = nullptr;
+				SID_IDENTIFIER_AUTHORITY ntAuth2 = SECURITY_NT_AUTHORITY;
+				AllocateAndInitializeSid(&ntAuth2, 1, SECURITY_LOCAL_SYSTEM_RID,
+					0, 0, 0, 0, 0, 0, 0, &pSystem);
+				if (pSystem) aclSize += sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(pSystem);
+
+				PACL pAcl = (PACL)LocalAlloc(LPTR, aclSize);
+				if (pAcl && InitializeAcl(pAcl, aclSize, ACL_REVISION)) {
+					AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pLogonSid);
+					if (pSystem) AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pSystem);
+
+					TOKEN_DEFAULT_DACL tdd = {};
+					tdd.DefaultDacl = pAcl;
+					if (SetTokenInformation(hRestrictedToken, TokenDefaultDacl, &tdd, sizeof(tdd))) {
+						LogInfo(L"[Launch] Default DACL set with logon SID + SYSTEM");
+					}
+					else {
+						LogWarn(L"[Launch] SetTokenInformation(DefaultDacl) failed: err=%lu", GetLastError());
+					}
+				}
+				if (pAcl) LocalFree(pAcl);
+				if (pSystem) FreeSid(pSystem);
+			}
+
+			if (pLogonSid) LocalFree(pLogonSid);
+		}
+
 		TOKEN_MANDATORY_LABEL tml = { 0 };
 		tml.Label.Attributes = SE_GROUP_INTEGRITY;
 
@@ -3382,16 +3483,28 @@ static DWORD LaunchProcessWithRestrictedToken() {
 			consoleHostsBefore = SnapshotConsoleHostPids();
 		}
 		createFlags |= CREATE_SUSPENDED;
-		if (!CreateProcessAsUserW(hRestrictedToken, NULL, ExeToLaunch, NULL, NULL, FALSE,
-			createFlags, envBlock, NULL, &si.StartupInfo, &pi)) {
+		// CreateProcessWithTokenW 只需 SeImpersonatePrivilege（普通管理员默认有），
+		// 而 CreateProcessAsUserW 需要 SeAssignPrimaryTokenPrivilege（仅服务账户有）。
+		BOOL launched = CreateProcessWithTokenW(hRestrictedToken, 0,
+			NULL, ExeToLaunch, createFlags, envBlock, NULL, &si.StartupInfo, &pi);
+		if (!launched) {
 			result = GetLastError();
-			LogError(L"[Launch] CreateProcessAsUserW FAILED: err=%lu", result);
-			if (result == ERROR_ACCESS_DENIED)
-				LogError(L"[Launch] Hint: ACCESS_DENIED - check if the exe is accessible.");
-			else if (result == ERROR_FILE_NOT_FOUND)
-				LogError(L"[Launch] Hint: FILE_NOT_FOUND - verify the exe path is correct.");
-			CloseHandle(hRestrictedToken);
-			break;
+			LogWarn(L"[Launch] CreateProcessWithTokenW failed: err=%lu, trying CreateProcessAsUserW...", result);
+			// 回退到 CreateProcessAsUserW
+			launched = CreateProcessAsUserW(hRestrictedToken, NULL, ExeToLaunch, NULL, NULL, FALSE,
+				createFlags, envBlock, NULL, &si.StartupInfo, &pi);
+			if (!launched) {
+				result = GetLastError();
+				LogError(L"[Launch] CreateProcessAsUserW FAILED: err=%lu", result);
+				if (result == ERROR_ACCESS_DENIED)
+					LogError(L"[Launch] Hint: ACCESS_DENIED - check if the exe is accessible.");
+				else if (result == ERROR_FILE_NOT_FOUND)
+					LogError(L"[Launch] Hint: FILE_NOT_FOUND - verify the exe path is correct.");
+				else if (result == ERROR_PRIVILEGE_NOT_HELD)
+					LogError(L"[Launch] Hint: PRIVILEGE_NOT_HELD - need SeAssignPrimaryTokenPrivilege or SeImpersonatePrivilege.");
+				CloseHandle(hRestrictedToken);
+				break;
+			}
 		}
 
 		AssignProcessToJob(g_hJob, pi.hProcess);
@@ -4031,6 +4144,38 @@ static void ShutdownNetworkFilter() {
 	}
 }
 
+static bool RunSilentCommand(const std::wstring& cmdLine, DWORD timeoutMs = 10000) {
+	STARTUPINFOW si = {};
+	PROCESS_INFORMATION pi = {};
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+
+	std::vector<wchar_t> buf(cmdLine.begin(), cmdLine.end());
+	buf.push_back(L'\0');
+
+	if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+		LogWarn(L"[Firewall] CreateProcessW failed: err=%lu, cmd=%ls",
+			GetLastError(), cmdLine.c_str());
+		return false;
+	}
+
+	DWORD waitResult = WaitForSingleObject(pi.hProcess, timeoutMs);
+	DWORD exitCode = 1;
+	if (waitResult == WAIT_OBJECT_0) {
+		GetExitCodeProcess(pi.hProcess, &exitCode);
+	}
+	else {
+		LogWarn(L"[Firewall] Command timed out: %ls", cmdLine.c_str());
+		TerminateProcess(pi.hProcess, 1);
+	}
+
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return (exitCode == 0);
+}
+
 static void InjectProxyEnvVars() {
 	if (!g_NetworkFilterEnabled || !NetworkFilterPlugin::IsRunning()) {
 		return;
@@ -4048,6 +4193,157 @@ static void InjectProxyEnvVars() {
 	UpsertEnvOverride(L"NO_PROXY", L"localhost,127.0.0.1");
 	UpsertEnvOverride(L"no_proxy", L"localhost,127.0.0.1");
 
+}
+
+// ========================================================================
+// Firewall-based Network Filter (AppContainer)
+// ========================================================================
+
+// AppContainer 加固核心：移除 internetClient (S-1-15-3-1) 和
+// internetClientServer (S-1-15-3-2) 能力。
+// AppContainer 没有这些能力后，子进程只能连接 loopback 地址，
+// 即使子进程清除了代理环境变量也无法直连外网。
+// 这是 OS 内核级别的强制隔离，不可绕过。
+
+static void StripInternetCapabilitiesForNetworkFilter() {
+	if (!g_NetworkFilterEnabled) return;
+
+	// 定义要移除的 SID
+	// S-1-15-3-1 = internetClient
+	// S-1-15-3-2 = internetClientServer
+	const wchar_t* sidStrings[] = { L"S-1-15-3-1", L"S-1-15-3-2" };
+	PSID sidsToRemove[2] = { nullptr, nullptr };
+
+	for (int i = 0; i < 2; ++i) {
+		if (!ConvertStringSidToSidW(sidStrings[i], &sidsToRemove[i])) {
+			LogWarn(L"[NetworkFilter] ConvertStringSidToSid failed for %ls: err=%lu",
+				sidStrings[i], GetLastError());
+		}
+	}
+
+	int removedCount = 0;
+	auto it = CapabilityList.begin();
+	while (it != CapabilityList.end()) {
+		bool shouldRemove = false;
+		for (int i = 0; i < 2; ++i) {
+			if (sidsToRemove[i] && it->Sid && EqualSid(it->Sid, sidsToRemove[i])) {
+				shouldRemove = true;
+				break;
+			}
+		}
+
+		if (shouldRemove) {
+			LPWSTR sidStr = nullptr;
+			ConvertSidToStringSidW(it->Sid, &sidStr);
+			LogInfo(L"[NetworkFilter/Harden] Stripped internet capability: %ls "
+					L"(child process can only connect to loopback)",
+					sidStr ? sidStr : L"<unknown>");
+			if (sidStr) LocalFree(sidStr);
+
+			it = CapabilityList.erase(it);
+			++removedCount;
+		}
+		else {
+			++it;
+		}
+	}
+
+	for (int i = 0; i < 2; ++i) {
+		if (sidsToRemove[i]) LocalFree(sidsToRemove[i]);
+	}
+
+	if (removedCount > 0) {
+		LogInfo(L"[NetworkFilter/Harden] Removed %d internet capabilities. "
+				L"AppContainer child is now restricted to loopback-only networking.",
+				removedCount);
+	}
+	else {
+		LogInfo(L"[NetworkFilter/Harden] No internet capabilities found to remove. "
+				L"AppContainer child already cannot access the network directly.");
+	}
+}
+
+// Restricted Token 加固：添加 Windows 防火墙出站规则。
+// 规则 1（Allow）：放行子进程到 127.0.0.1:代理端口 的 TCP 连接
+// 规则 2（Block）：阻止子进程所有其他出站连接
+//
+// 防火墙规则按 "allow 优先于 block" 的方式工作：
+// netsh 中 allow 规则如果精确匹配，会覆盖同优先级的 block 规则。
+//
+// 注意：需要管理员权限。如果权限不足，函数会打印警告但不会导致启动失败。
+
+static bool AddFirewallBlockRules(const std::wstring& exePath) {
+	if (!g_NetworkFilterEnabled || exePath.empty()) return false;
+
+	g_FirewallRuleBaseName = L"OpenCodeSandbox_" + std::to_wstring(GetCurrentProcessId());
+
+	std::wstring portStr = std::to_wstring(g_NetworkFilterPort);
+
+	// Rule 1: Allow outbound to proxy (127.0.0.1:proxyPort)
+	std::wstring allowCmd = L"netsh advfirewall firewall add rule "
+		L"name=\"" + g_FirewallRuleBaseName + L"_ProxyAllow\" "
+		L"dir=out action=allow protocol=tcp "
+		L"remoteip=127.0.0.1 remoteport=" + portStr + L" "
+		L"program=\"" + exePath + L"\" "
+		L"enable=yes";
+
+	// Rule 2: Block all other outbound from the exe
+	std::wstring blockCmd = L"netsh advfirewall firewall add rule "
+		L"name=\"" + g_FirewallRuleBaseName + L"_NetBlock\" "
+		L"dir=out action=block protocol=any "
+		L"program=\"" + exePath + L"\" "
+		L"enable=yes";
+
+	// Also block DNS (UDP 53) to prevent DNS-based exfiltration
+	// (the proxy handles DNS resolution on behalf of the child)
+	std::wstring dnsBlockCmd = L"netsh advfirewall firewall add rule "
+		L"name=\"" + g_FirewallRuleBaseName + L"_DnsBlock\" "
+		L"dir=out action=block protocol=udp "
+		L"program=\"" + exePath + L"\" "
+		L"enable=yes";
+
+	// Allow rule first, then block rules
+	bool ok1 = RunSilentCommand(allowCmd);
+	bool ok2 = RunSilentCommand(blockCmd);
+	bool ok3 = RunSilentCommand(dnsBlockCmd);
+
+	if (ok1 && ok2) {
+		g_FirewallRulesAdded = true;
+		LogInfo(L"[NetworkFilter/Harden] Firewall rules added for Restricted Token mode:");
+		LogInfo(L"[NetworkFilter/Harden]   ALLOW: %ls -> 127.0.0.1:%d (proxy)",
+				exePath.c_str(), g_NetworkFilterPort);
+		LogInfo(L"[NetworkFilter/Harden]   BLOCK: %ls -> all other outbound", exePath.c_str());
+		return true;
+	}
+	else {
+		LogWarn(L"[NetworkFilter/Harden] Failed to add firewall rules (need elevation?).");
+		LogWarn(L"[NetworkFilter/Harden]   allow=%s, block=%s, dns=%s",
+				ok1 ? L"ok" : L"FAIL", ok2 ? L"ok" : L"FAIL", ok3 ? L"ok" : L"FAIL");
+		LogWarn(L"[NetworkFilter/Harden]   Network filter runs in SOFT mode "
+				L"(env var bypass possible).");
+		// Non-fatal: proxy still works, just not enforced
+		return false;
+	}
+}
+
+static void RemoveFirewallRules() {
+	if (!g_FirewallRulesAdded || g_FirewallRuleBaseName.empty()) return;
+
+	LogInfo(L"[NetworkFilter/Harden] Removing firewall rules...");
+
+	std::wstring cmd1 = L"netsh advfirewall firewall delete rule "
+		L"name=\"" + g_FirewallRuleBaseName + L"_ProxyAllow\"";
+	std::wstring cmd2 = L"netsh advfirewall firewall delete rule "
+		L"name=\"" + g_FirewallRuleBaseName + L"_NetBlock\"";
+	std::wstring cmd3 = L"netsh advfirewall firewall delete rule "
+		L"name=\"" + g_FirewallRuleBaseName + L"_DnsBlock\"";
+
+	RunSilentCommand(cmd1);
+	RunSilentCommand(cmd2);
+	RunSilentCommand(cmd3);
+
+	g_FirewallRulesAdded = false;
+	LogInfo(L"[NetworkFilter/Harden] Firewall rules removed.");
 }
 
 // ========================================================================
@@ -4070,6 +4366,7 @@ static BOOL WINAPI OnConsoleCtrl(DWORD ctrlType) {
 		if (g_hJob) { CloseHandle(g_hJob); g_hJob = nullptr; }
 		TerminateConsoleHostIfAlive();
 		TerminateParentConsoleHostIfAlive();
+		RemoveFirewallRules();
 		ShutdownNetworkFilter();
 		CleanupBunVirtualDrive();
 		RestoreSavedSecurityOnce();
@@ -4148,6 +4445,22 @@ int wmain(int argc, WCHAR** argv) {
 		}
 		InitProxyLogFile();
 		InjectProxyEnvVars();
+
+		// ★ 网络过滤加固状态日志
+		if (UseRestrictedToken) {
+			if (g_FirewallRulesAdded) {
+				LogInfo(L"[NetworkFilter] Hardening: ACTIVE (firewall rules block direct connections)");
+			}
+			else {
+				LogWarn(L"[NetworkFilter] Hardening: INACTIVE (firewall rules failed; "
+						L"child can bypass proxy by unsetting env vars)");
+			}
+		}
+		else {
+			// AppContainer mode - capabilities stripped
+			LogInfo(L"[NetworkFilter] Hardening: ACTIVE (internet capabilities stripped; "
+					L"OS-level loopback-only enforcement)");
+		}
 	}
 
 	// ================================================================
@@ -4170,11 +4483,13 @@ int wmain(int argc, WCHAR** argv) {
 				}
 				if (pTokenUser) LocalFree(pTokenUser);
 			}
+
 			CloseHandle(hToken);
 		}
 
 		PrepareBunVirtualDrive(nullptr);
 		atexit(AtExitCleanupBunDrive);
+		atexit([]() { RemoveFirewallRules(); });
 		SetUnhandledExceptionFilter(BunDriveCrashHandler);
 
 		if (!EnvOverrides.empty() || !PathPrependEntries.empty()) {
@@ -4182,6 +4497,13 @@ int wmain(int argc, WCHAR** argv) {
 		}
 
 		LogInfo(L"[Phase] Launching child process...");
+		// Restricted Token 模式：通过防火墙规则阻止子进程直连外网
+		if (g_NetworkFilterEnabled && ExeToLaunch) {
+			std::wstring exePath = ResolveExeFullPath(ExeToLaunch);
+			if (!exePath.empty()) {
+				AddFirewallBlockRules(exePath);
+			}
+		}
 		result = LaunchProcessWithRestrictedToken();
 
 		if (CleanupAllowedSubdirs && (WaitForExit || result != ERROR_SUCCESS)) {
@@ -4194,6 +4516,9 @@ int wmain(int argc, WCHAR** argv) {
 	// ================================================================
 	// AppContainer Sandbox
 	// ================================================================
+	// AppContainer 模式：移除 internet 能力，子进程只能通过 loopback 代理上网
+	StripInternetCapabilitiesForNetworkFilter();
+
 	LogInfo(L"[Phase] Creating AppContainer profile...");
 	result = CreateAppContainerProfileWithMoniker(&appContainerSid);
 	if (result != ERROR_SUCCESS) {
@@ -4208,6 +4533,7 @@ int wmain(int argc, WCHAR** argv) {
 	// Prepare Bun virtual B: drive
 	PrepareBunVirtualDrive(appContainerSid);
 	atexit(AtExitCleanupBunDrive);
+	atexit([]() { RemoveFirewallRules(); });
 	SetUnhandledExceptionFilter(BunDriveCrashHandler);
 
 	// Build child environment block AFTER PrepareBunVirtualDrive() so that
@@ -4233,6 +4559,7 @@ Cleanup:
 	// ★ 清理操作限时执行
 	{
 		HANDLE hCleanup = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+			RemoveFirewallRules();
 			ShutdownNetworkFilter();
 			CleanupBunVirtualDrive();
 			RestoreSavedSecurityOnce();

@@ -115,6 +115,7 @@ LaunchAppContainer/
 - **双沙箱模式**: AppContainer（强隔离）和 Restricted Token（允许子进程）
 - **文件系统隔离**: 精细的路径访问控制，支持四种权限级别
 - **网络过滤**: 内置 HTTP/HTTPS 代理，支持域名白名单
+- **网络加固**: AppContainer 模式剥离 internet 能力 SID（OS 级 loopback-only）；Restricted Token 模式通过 Windows 防火墙规则阻止直连外网
 - **注册表保护**: 低完整性级别自动启用注册表虚拟化
 - **进程缓解策略**: Win32k 锁定、子进程控制等
 - **Bun/OpenCode 支持**: 自动提取嵌入式 DLL，配置虚拟驱动器
@@ -243,6 +244,24 @@ LaunchAppContainer.exe [选项]
 - 精确匹配: `api.example.com`
 - 通配符匹配: `*.example.com`
 - 允许所有: `*`
+
+#### 网络加固机制
+
+启用 `networkFilterEnabled` 后，除了注入代理环境变量外，程序会根据沙箱模式自动启用 OS 级别的网络加固，防止子进程绕过代理直连外网：
+
+| 沙箱模式 | 加固方式 | 原理 | 可绕过性 |
+|----------|----------|------|----------|
+| AppContainer | 剥离 internet 能力 SID | 移除 `S-1-15-3-1` (internetClient) 和 `S-1-15-3-2` (internetClientServer)，OS 内核强制子进程只能连接 loopback | 不可绕过（内核级） |
+| Restricted Token | Windows 防火墙出站规则 | 添加 allow 规则放行到 `127.0.0.1:代理端口`，block 规则阻止所有其他出站连接 | 需要管理员权限才能生效 |
+
+AppContainer 模式下的加固是内核级别的，即使子进程清除了代理环境变量也无法直连外网。
+
+Restricted Token 模式下的防火墙规则包含三条：
+1. `_ProxyAllow` — 放行到 `127.0.0.1:proxyPort` 的 TCP 出站
+2. `_NetBlock` — 阻止所有其他出站连接
+3. `_DnsBlock` — 阻止 UDP 出站（防止 DNS 泄露）
+
+防火墙规则在进程退出时自动清理（通过 Cleanup、OnConsoleCtrl、atexit 三重保障）。
 
 ### 环境变量
 
